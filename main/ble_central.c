@@ -279,6 +279,13 @@ static void subscribe(void)
 {
     ESP_LOGI(TAG, "Subscribing: val=0x%04x cccd=0x%04x out=0x%04x",
              g_input_val_handle, g_input_cccd_handle, g_output_val_handle);
+
+    // Ensure the link is encrypted — Stadia requires it for HID notifications
+    int rc = ble_gap_security_initiate(g_conn_handle);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "Security initiate failed: %d (continuing anyway)", rc);
+    }
+
     uint8_t val[2] = {0x01, 0x00};
     ble_gattc_write_flat(g_conn_handle, g_input_cccd_handle,
                          val, sizeof(val), cccd_write_fn, NULL);
@@ -356,18 +363,33 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
         esp_timer_start_once(s_reconnect_timer, 1000000 /* 1 s in µs */);
         break;
 
-    case BLE_GAP_EVENT_NOTIFY_RX:
-        if (event->notify_rx.attr_handle == g_input_val_handle) {
-            uint8_t stadia[9];
-            uint16_t len = 0;
-            if (ble_hs_mbuf_to_flat(event->notify_rx.om, stadia, 9, &len) == 0
-                && len == 9) {
-                uint8_t xbox[20];
-                stadia_to_xbox360(stadia, xbox);
-                xQueueSendToBack(ble_to_usb_queue, xbox, 0);
-            }
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        if (event->notify_rx.attr_handle != g_input_val_handle) break;
+
+        uint8_t raw[16];
+        uint16_t len = 0;
+        if (ble_hs_mbuf_to_flat(event->notify_rx.om, raw, sizeof(raw), &len) != 0) {
+            ESP_LOGW(TAG, "mbuf extract failed");
+            break;
         }
+
+        #if DONGLE_DEBUG
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, raw, len, ESP_LOG_INFO);
+        #endif
+
+        // Stadia BLE sends 10 bytes: 9-byte report + 1 trailing byte.
+        // Report ID is NOT included (stripped per HOGP spec); use bytes [0..8].
+        if (len < 9) {
+            ESP_LOGW(TAG, "HID report too short: len=%d", len);
+            break;
+        }
+        const uint8_t *stadia = raw;
+
+        uint8_t xbox[20];
+        stadia_to_xbox360(stadia, xbox);
+        xQueueSendToBack(ble_to_usb_queue, xbox, 0);
         break;
+    }
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         ESP_LOGI(TAG, "Encryption status: %d", event->enc_change.status);

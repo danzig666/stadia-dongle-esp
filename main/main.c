@@ -5,7 +5,7 @@
  *   Core 0, pri 5 — nimble_host_task    (NimBLE host stack, via nimble_port_freertos_init)
  *   Core 0, pri 3 — ble_rumble_task     (drain usb_to_ble → ble_central_send_rumble)
  *   Core 1, pri 4 — tinyusb device task (created internally by tinyusb_driver_install)
- *   Core 1, pri 4 — usb_xbox_task       (drain ble_to_usb → tud_vendor_n_write)
+ *   Core 1, pri 4 — usb_xbox_task       (drain ble_to_usb → xbox_send_report)
  */
 
 #include "freertos/FreeRTOS.h"

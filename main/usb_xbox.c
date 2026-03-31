@@ -1,29 +1,31 @@
 /*
- * usb_xbox.c — TinyUSB vendor-class driver presenting as an Xbox 360 wired controller.
+ * usb_xbox.c — Xbox 360 wired controller USB descriptors and input task.
  *
  * The Xbox 360 controller uses USB class 0xFF (vendor-specific), not HID.
  * Windows loads xusb22.sys natively when it sees VID=0x045E / PID=0x028E.
  *
- * USB descriptor layout (64 bytes total):
- *   Configuration (9) + Interface 0 (9) + Xbox vendor descriptor (17)
+ * USB descriptor layout (48 bytes total):
+ *   Configuration (9) + Interface 0 (9) + Xbox vendor descriptor (16)
  *   + EP1 IN (7) + EP2 OUT (7)
- *   + Interface 1 / security descriptor (9) + security data (6)
  *
  * Interface 0 (class FF/5D/01) handles all data:
  *   EP1 IN  (0x81): interrupt, 32 bytes, 4 ms  → host reads Xbox input reports
  *   EP2 OUT (0x02): interrupt, 32 bytes, 8 ms  → host writes rumble commands
  *
- * Interface 1 (class FF/5D/03, 0 endpoints): the "security descriptor" that Windows
- * requires to recognise the device as an XInput controller.  The firmware does not
- * actively use this interface; it only needs to appear in the descriptor.
+ * Descriptor matches fluffymadness/tinyusb-xinput (verified working with
+ * xusb22.sys). Single interface, 16-byte 0x21 Xbox vendor descriptor.
+ *
+ * Endpoint transfers are handled by the custom class driver in xbox_dev.c,
+ * which uses direct usbd_edpt_xfer() calls instead of the TinyUSB vendor
+ * class FIFO (the vendor class uses bulk semantics that stall on interrupt EPs).
  */
 
 #include "usb_xbox.h"
+#include "xbox_dev.h"
 #include "bridge.h"
 
 #include "esp_log.h"
 #include "tinyusb.h"
-#include "class/vendor/vendor_device.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -48,13 +50,13 @@ static const tusb_desc_device_t s_device_desc = {
     .bNumConfigurations = 1,
 };
 
-// Total: 9+9+17+7+7+9+6 = 64 bytes
-#define XBOX_CFG_LEN 64
+// Total: 9+9+16+7+7 = 48 bytes (fluffymadness/tinyusb-xinput layout)
+#define XBOX_CFG_LEN 48
 
 static const uint8_t s_cfg_desc[XBOX_CFG_LEN] = {
     // ----- Configuration Descriptor (9) -----
-    0x09, 0x02, XBOX_CFG_LEN, 0x00,
-    0x02,       // bNumInterfaces = 2
+    0x09, 0x02, 0x30, 0x00,
+    0x01,       // bNumInterfaces = 1
     0x01,       // bConfigurationValue
     0x00,       // iConfiguration
     0xa0,       // bmAttributes: bus-powered, remote-wakeup
@@ -70,34 +72,18 @@ static const uint8_t s_cfg_desc[XBOX_CFG_LEN] = {
     0x01,       // bInterfaceProtocol
     0x00,       // iInterface
 
-    // ----- Xbox 360 proprietary descriptor (17, type 0x21) -----
-    // Reverse-engineered from real hardware; references EP1 IN and EP2 OUT.
-    0x11, 0x21, 0x00, 0x01, 0x01, 0x25,
+    // ----- Xbox vendor descriptor (16, type 0x21) — fluffymadness bytes -----
+    0x10, 0x21, 0x10, 0x01, 0x01, 0x24,
     0x81,                               // EP1 IN address
     0x14, 0x03, 0x00, 0x03, 0x13,
     0x02,                               // EP2 OUT address
-    0x00, 0x03, 0x00, 0x03,
+    0x00, 0x03, 0x00,
 
     // ----- EP1 IN: Interrupt, 32 bytes, 4 ms (7) -----
     0x07, 0x05, 0x81, 0x03, 0x20, 0x00, 0x04,
 
     // ----- EP2 OUT: Interrupt, 32 bytes, 8 ms (7) -----
     0x07, 0x05, 0x02, 0x03, 0x20, 0x00, 0x08,
-
-    // ----- Interface 1: Security Descriptor (9) -----
-    // Windows requires this interface (class FF/5D/03) to load xusb22.sys.
-    // No endpoints; firmware does not service this interface.
-    0x09, 0x04,
-    0x01,       // bInterfaceNumber
-    0x00,       // bAlternateSetting
-    0x00,       // bNumEndpoints
-    0xff,       // bInterfaceClass
-    0x5d,       // bInterfaceSubClass
-    0x03,       // bInterfaceProtocol
-    0x00,       // iInterface
-
-    // ----- Security descriptor data (6, type 0x41) -----
-    0x06, 0x41, 0x00, 0x01, 0x01, 0x03,
 };
 
 // String descriptors: [0] language, [1] manufacturer, [2] product, [3] serial
@@ -108,28 +94,6 @@ static const char *s_str_desc[] = {
     "000000000001",       // [3] iSerialNumber
 };
 
-/* ---- Rumble receive (EP2 OUT → usb_to_ble queue) ------------------------ */
-
-/*
- * Xbox 360 rumble output report (8 bytes):
- *   [0] 0x00
- *   [1] 0x08 (length)
- *   [2] 0x00
- *   [3] Large motor (0–255)
- *   [4] Small motor (0–255)
- *   [5–7] 0x00
- *
- * Mapped to 4-byte Stadia rumble payload (uint16 LE strong, uint16 LE weak):
- *   [0] 0x00  [1] large_motor   [2] 0x00  [3] small_motor
- */
-void tud_vendor_rx_cb(uint8_t itf, uint8_t const *buffer, uint16_t bufsize)
-{
-    if (bufsize >= 5 && buffer[0] == 0x00 && buffer[1] == 0x08) {
-        uint8_t rumble[4] = {0x00, buffer[3], 0x00, buffer[4]};
-        xQueueSendToBack(usb_to_ble_queue, rumble, 0);
-    }
-}
-
 /* ---- USB Xbox task ------------------------------------------------------- */
 
 void usb_xbox_task(void *arg)
@@ -137,10 +101,17 @@ void usb_xbox_task(void *arg)
     uint8_t report[20];
     while (1) {
         if (xQueueReceive(ble_to_usb_queue, report, pdMS_TO_TICKS(10))) {
-            if (tud_connected() && tud_vendor_n_write_available(0) >= 20) {
-                tud_vendor_n_write(0, report, 20);
-                tud_vendor_n_flush(0);
+            // Drain to latest report — for a gamepad only the newest state matters
+            while (xQueueReceive(ble_to_usb_queue, report, 0)) {}
+
+            bool sent = xbox_send_report(report);
+            #if DONGLE_DEBUG
+            if (sent) {
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG, report, 20, ESP_LOG_INFO);
+            } else {
+                ESP_LOGW(TAG, "EP busy or disconnected");
             }
+            #endif
         }
     }
 }

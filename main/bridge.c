@@ -1,7 +1,7 @@
 /*
  * bridge.c — Translation between Stadia BLE input reports and Xbox 360 USB reports.
  *
- * Stadia BLE notification payload (9 bytes, no Report ID):
+ * Stadia BLE notification payload (10 bytes, no Report ID; byte 9 unused):
  *   [0] D-pad hat (0=Up … 7=Up-L, >7=neutral)
  *   [1] bits 7=RS, 6=OPTIONS, 5=MENU, 4=STADIA_BTN
  *   [2] bits 6=A, 5=B, 4=X, 3=Y, 2=LB, 1=RB, 0=LS
