@@ -98,6 +98,9 @@ static void on_sync(void)
 
 static void start_scan(void)
 {
+    // Cancel any ongoing scan first — safe no-op if not scanning.
+    ble_gap_disc_cancel();
+
     uint8_t own_addr_type;
     ble_hs_id_infer_auto(0, &own_addr_type);
 
@@ -107,7 +110,9 @@ static void start_scan(void)
     };
     int rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event_fn, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_disc failed: %d", rc);
+        // Stack may still be busy (e.g. terminate not yet complete) — retry in 1 s.
+        ESP_LOGE(TAG, "ble_gap_disc failed: %d — retrying in 1 s", rc);
+        esp_timer_start_once(s_reconnect_timer, 1000000);
     } else {
         ESP_LOGI(TAG, "Scanning for Stadia controller…");
     }
@@ -364,6 +369,7 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
                  event->disconnect.reason);
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         bridge_send_neutral(); // release all buttons/axes on the USB host side
+        esp_timer_stop(s_reconnect_timer); // no-op if not running; prevents INVALID_STATE
         esp_timer_start_once(s_reconnect_timer, 1000000 /* 1 s in µs */);
         break;
 
