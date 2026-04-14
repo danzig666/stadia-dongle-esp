@@ -106,7 +106,8 @@ static void start_scan(void)
 
     struct ble_gap_disc_params params = {
         .passive           = 0, // active scan to get scan-response (name)
-        .filter_duplicates = 1,
+        .filter_duplicates = 0, // must be 0: directed adv (no name) would poison the
+                                // hardware filter and suppress the subsequent general adv
     };
     int rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event_fn, NULL);
     if (rc != 0) {
