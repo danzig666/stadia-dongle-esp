@@ -79,8 +79,8 @@ static const uint8_t s_cfg_desc[XBOX_CFG_LEN] = {
     0x02,                               // EP2 OUT address
     0x00, 0x03, 0x00,
 
-    // ----- EP1 IN: Interrupt, 32 bytes, 8 ms (7) -----
-    0x07, 0x05, 0x81, 0x03, 0x20, 0x00, 0x08,
+    // ----- EP1 IN: Interrupt, 32 bytes, 4 ms (7) -----
+    0x07, 0x05, 0x81, 0x03, 0x20, 0x00, 0x04,
 
     // ----- EP2 OUT: Interrupt, 32 bytes, 8 ms (7) -----
     0x07, 0x05, 0x02, 0x03, 0x20, 0x00, 0x08,
@@ -102,19 +102,27 @@ void usb_xbox_task(void *arg)
     bool have_report = false;
     while (1) {
         if (!have_report) {
-            if (!xQueueReceive(ble_to_usb_queue, report, pdMS_TO_TICKS(8))) continue;
-            // Drain to latest report — for a gamepad only the newest state matters
-            while (xQueueReceive(ble_to_usb_queue, report, 0)) {}
+            if (!xQueueReceive(ble_to_usb_queue, report, pdMS_TO_TICKS(4))) continue;
             have_report = true;
         }
-        if (xbox_send_report(report)) {
+        // Drain to latest report, even if we were waiting to retry sending
+        while (xQueueReceive(ble_to_usb_queue, report, 0)) {
+            have_report = true;
+        }
+
+        int res = xbox_send_report(report);
+        if (res == 1) {
             #if DONGLE_DEBUG
             ESP_LOG_BUFFER_HEX_LEVEL(TAG, report, 20, ESP_LOG_INFO);
             #endif
             have_report = false;
+        } else if (res == -1) {
+            // Disconnected: discard report to allow queue draining
+            have_report = false;
+            vTaskDelay(pdMS_TO_TICKS(10));
         } else {
             #if DONGLE_DEBUG
-            ESP_LOGW(TAG, "EP busy or disconnected, retrying");
+            ESP_LOGW(TAG, "EP busy, retrying");
             #endif
             vTaskDelay(pdMS_TO_TICKS(2)); // yield briefly before retry
         }

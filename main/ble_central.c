@@ -435,17 +435,26 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
 
         uint8_t xbox[20];
         stadia_to_xbox360(stadia, xbox);
-        xQueueSendToBack(ble_to_usb_queue, xbox, 0);
+        if (xQueueSendToBack(ble_to_usb_queue, xbox, 0) != pdTRUE) {
+            uint8_t dummy[20];
+            xQueueReceive(ble_to_usb_queue, dummy, 0);
+            xQueueSendToBack(ble_to_usb_queue, xbox, 0);
+        }
         break;
     }
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         ESP_LOGI(TAG, "Encryption status: %d", event->enc_change.status);
-        if (event->enc_change.status == 0 && g_input_cccd_handle != 0) {
-            // Link is now encrypted — safe to enable notifications
-            uint8_t val[2] = {0x01, 0x00};
-            ble_gattc_write_flat(event->enc_change.conn_handle, g_input_cccd_handle,
-                                 val, sizeof(val), cccd_write_fn, NULL);
+        if (event->enc_change.status == 0) {
+            if (g_input_cccd_handle != 0) {
+                // Link is now encrypted — safe to enable notifications
+                uint8_t val[2] = {0x01, 0x00};
+                ble_gattc_write_flat(event->enc_change.conn_handle, g_input_cccd_handle,
+                                     val, sizeof(val), cccd_write_fn, NULL);
+            }
+        } else {
+            ESP_LOGE(TAG, "Encryption failed: %d — forcing disconnect", event->enc_change.status);
+            ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         }
         break;
 

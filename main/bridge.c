@@ -41,6 +41,7 @@ void bridge_init(void)
 void bridge_send_neutral(void)
 {
     uint8_t neutral[20] = {0x00, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    xQueueReset(ble_to_usb_queue);
     xQueueSendToBack(ble_to_usb_queue, neutral, 0);
 }
 

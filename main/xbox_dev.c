@@ -77,9 +77,11 @@ static uint16_t xbox_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc,
             ESP_LOGI(TAG, "Opened EP 0x%02x", ep->bEndpointAddress);
 
             if (ep->bEndpointAddress == XBOX_EP_OUT) {
-                usbd_edpt_claim(rhport, XBOX_EP_OUT);
-                usbd_edpt_xfer(rhport, XBOX_EP_OUT, s_out_buf, XBOX_EP_SIZE);
-                usbd_edpt_release(rhport, XBOX_EP_OUT);
+                if (usbd_edpt_claim(rhport, XBOX_EP_OUT)) {
+                    if (!usbd_edpt_xfer(rhport, XBOX_EP_OUT, s_out_buf, XBOX_EP_SIZE)) {
+                        usbd_edpt_release(rhport, XBOX_EP_OUT);
+                    }
+                }
             }
             found++;
         }
@@ -117,12 +119,18 @@ static bool xbox_xfer_cb(uint8_t rhport, uint8_t ep_addr,
         // Xbox 360 rumble: [0]=0x00 [1]=0x08 [2]=0x00 [3]=large [4]=small
         if (xferred_bytes >= 5 && s_out_buf[0] == 0x00 && s_out_buf[1] == 0x08) {
             uint8_t rumble[4] = { 0x00, s_out_buf[3], 0x00, s_out_buf[4] };
-            xQueueSendToBack(usb_to_ble_queue, rumble, 0);
+            if (xQueueSendToBack(usb_to_ble_queue, rumble, 0) != pdTRUE) {
+                uint8_t dummy[4];
+                xQueueReceive(usb_to_ble_queue, dummy, 0);
+                xQueueSendToBack(usb_to_ble_queue, rumble, 0);
+            }
         }
         // Re-arm OUT endpoint
-        usbd_edpt_claim(rhport, XBOX_EP_OUT);
-        usbd_edpt_xfer(rhport, XBOX_EP_OUT, s_out_buf, XBOX_EP_SIZE);
-        usbd_edpt_release(rhport, XBOX_EP_OUT);
+        if (usbd_edpt_claim(rhport, XBOX_EP_OUT)) {
+            if (!usbd_edpt_xfer(rhport, XBOX_EP_OUT, s_out_buf, XBOX_EP_SIZE)) {
+                usbd_edpt_release(rhport, XBOX_EP_OUT);
+            }
+        }
     }
     return true;
 }
@@ -178,13 +186,17 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
 
 /* ---- Public API --------------------------------------------------------- */
 
-bool xbox_send_report(const uint8_t *report) {
-    if (!tud_connected() || !s_rhport_ready) return false;
-    if (usbd_edpt_busy(s_rhport, XBOX_EP_IN)) return false;
+int xbox_send_report(const uint8_t *report) {
+    if (!tud_connected() || !s_rhport_ready) return -1;
+    if (usbd_edpt_busy(s_rhport, XBOX_EP_IN)) return 0;
 
     memcpy(s_in_buf, report, 20);
-    usbd_edpt_claim(s_rhport, XBOX_EP_IN);
-    bool ok = usbd_edpt_xfer(s_rhport, XBOX_EP_IN, s_in_buf, 20);
-    usbd_edpt_release(s_rhport, XBOX_EP_IN);
-    return ok;
+    if (usbd_edpt_claim(s_rhport, XBOX_EP_IN)) {
+        bool ok = usbd_edpt_xfer(s_rhport, XBOX_EP_IN, s_in_buf, 20);
+        if (!ok) {
+            usbd_edpt_release(s_rhport, XBOX_EP_IN);
+        }
+        return ok ? 1 : 0;
+    }
+    return 0;
 }
