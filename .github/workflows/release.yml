@@ -29,7 +29,7 @@ jobs:
             idf.py build &&
             python -m esptool --chip esp32s3 merge_bin
             --output build/firmware-merged.bin
-            --flash-mode dio --flash-size 2MB --flash-freq 80m
+            --flash-mode dio --flash-size 4MB --flash-freq 80m
             0x0     build/bootloader/bootloader.bin
             0x8000  build/partition_table/partition-table.bin
             0x10000 build/stadia-dongle.bin
