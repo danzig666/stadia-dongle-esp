@@ -1,86 +1,179 @@
 # Stadia Controller Dongle
 
-Presents a Google Stadia controller as an Xbox 360 gamepad over USB. The ESP32-S3
-connects to the controller via BLE and appears to the host PC as a wired Xbox 360
-controller — no drivers required on Windows, Linux, or macOS.
+ESP32-S3 firmware that bridges Google Stadia controllers (Bluetooth LE) to a PC
+as a wired **Xbox 360 controller** + **HID mouse** + **HID keyboard**. Wi-Fi
+captive portal for pairing, button remapping, and OTA updates.
 
-Plug the dongle into your PC, hold the Stadia button on the controller to pair, and it works.
+Forked from [Scalee/stadia-dongle](https://github.com/Scalee/stadia-dongle).
 
-### Why a dongle?
+## Requirements
 
-After Google shut down Stadia, they released a firmware update enabling the controller's
-Bluetooth mode. On Windows, input works fine but **rumble does not** — and it cannot be
-fixed in software.
+- **ESP32-S3** module with native USB OTG
+- **4 MB** flash (default) or 16 MB — configurable via `sdkconfig.defaults`
+- Optional: WS2812/SK6812 RGB LED on GPIO 48 (configurable in menuconfig)
+- [ESP-IDF v6.x](https://github.com/espressif/esp-idf)
 
-The root cause is a Windows kernel driver limitation: the Windows BLE HID driver holds
-exclusive access to the controller's GATT service, blocking all output reports. Neither
-`WriteFile` (returns error 87 — the BLE stack sends a write-without-response which the
-Stadia firmware rejects) nor `HidD_SetOutputReport` (fails silently) can send the rumble
-command. Direct GATT access via WinRT is also denied while the HID driver is active, and
-disabling the driver drops the Bluetooth connection entirely.
-
-The ESP32-S3 sidesteps all of this. Its BLE stack correctly issues a GATT
-write-with-response for the rumble characteristic — exactly what the Stadia firmware
-requires. The host PC only sees a standard wired Xbox 360 controller over USB, so no
-special software or drivers are needed on the PC side at all.
-
-### Hardware
-
-Any ESP32-S3 board with native USB (USB OTG on GPIO19/20). The USB port connected
-to the host must be the native USB port, not UART.
-
-### Flashing
-
-**Easy — no software needed:** use the web installer in Chrome or Edge.
-
-👉 **[scalee.github.io/stadia-dongle](https://scalee.github.io/stadia-dongle/)**
-
-Connect the ESP32-S3 via the **COM/UART USB port**, click Install, then move it to the **native USB port** after flashing.
-
-<details>
-<summary>Building and flashing from source</summary>
-
-Requires [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/) v6.0 with target `esp32s3`.
+## Build
 
 ```sh
+idf.py set-target esp32s3
 idf.py build
+```
+
+`sdkconfig.defaults` pre-configures NimBLE central, TinyUSB, 240 MHz CPU, and
+production logging. The default partition table fits 4 MB flash with dual OTA
+slots.
+
+### Flash
+
+```sh
 idf.py -p <PORT> flash
 ```
 
-</details>
-
-### Pairing
-
-The dongle bonds to the first Stadia controller it sees. The bond is stored in NVS
-(flash) and survives power cycles. To pair a different controller, erase NVS:
+Merged binary for the [ESP Web Tools](https://esphome.github.io/esp-web-tools/)
+installer:
 
 ```sh
-idf.py -p <PORT> erase-flash
+esptool.py --chip esp32s3 merge_bin \
+  -o docs/firmware-merged.bin \
+  --flash_mode dio --flash_freq 80m --flash_size 4MB \
+  0x0 build/bootloader/bootloader.bin \
+  0x8000 build/partition_table/partition-table.bin \
+  0x20000 build/stadia-dongle.bin
 ```
 
-### Button mapping
+Host the `docs/` folder and open `docs/index.html` in Chrome/Edge.
 
-| Stadia          | Xbox 360     |
-|-----------------|--------------|
-| A / B / X / Y  | A / B / X / Y |
-| LB / RB        | LB / RB      |
-| LT / RT        | LT / RT      |
-| LS / RS        | LS / RS      |
-| Menu           | Start        |
-| Options        | Back         |
-| Stadia button  | Guide        |
-| D-pad          | D-pad        |
+## Setup
 
-Rumble is fully supported in both directions.
+1. Flash the firmware.
+2. On first boot, the dongle starts a setup AP automatically.
+3. Join Wi-Fi **`StadiaDongle-XXXX`** (open, no password).
+4. Open `http://192.168.4.1` (captive portal should redirect).
+5. Click **Start Pairing**, then put the controller in Bluetooth mode
+   (hold **Stadia + Y** until orange flash).
+6. Once bonded, the dongle auto-connects on future boots.
 
-### Assistant button — hold 3 s
+## Controller Modes
 
-Hold the Assistant button for 3 seconds to toggle rumble on/off. A short haptic
-pattern confirms the state change.
+### Gamepad Mode
 
-### Debug logging
+The controller appears as an **Xbox 360 Controller for Windows** (VID 0x045E,
+PID 0x0289). Button mapping:
 
-In `bridge.h`, set `DONGLE_DEBUG 1` to enable raw HID report hex dumps over UART.
-Set to `0` for production builds.
+| Stadia          | Xbox 360  |
+|-----------------|-----------|
+| A / B / X / Y   | A / B / X / Y |
+| LB / RB         | LB / RB |
+| LT / RT         | LT / RT (analog) |
+| LS / RS click   | LS / RS |
+| Left Stick      | Left Stick |
+| Right Stick     | Right Stick |
+| D-pad           | D-pad |
+| Menu            | Start |
+| Options         | Back |
+| Stadia button   | Guide |
 
----
+### Mouse Mode
+
+Hold **Assistant + Capture** for 2 seconds to toggle. Rumble confirms: 2 pulses
+= mouse ON, 3 pulses = controller mode restored. Always starts in controller
+mode after power-on. While active, the Xbox gamepad interface sends neutral
+reports (sticks centered, buttons released) and all input is routed to the HID
+mouse.
+
+| Stadia input   | Mouse action                                       |
+|----------------|----------------------------------------------------|
+| Left stick     | Cursor movement (deadzone, acceleration curve, smoothing) |
+| A              | Left click                                         |
+| B              | Right click                                        |
+| X              | Middle click                                       |
+| D-pad up/down  | Scroll wheel (±1 per press)                        |
+| Right stick Y  | Analog scroll wheel                                |
+| LT (hold)      | Precision mode — cursor speed ÷ 3                  |
+| RT (hold)      | Fast mode — cursor speed × 2                       |
+| Stadia / LB / RB / LS / RS / Menu / Options | Inactive (neutral Xbox reports) |
+
+Mouse reports are driven by a 125 Hz hardware timer for smooth, jitter-free movement.
+
+### Multi-Controller
+
+Up to **2 controllers** can be paired and used concurrently. Each appears as a
+separate Xbox 360 gamepad. Mouse mode and button mappings are per-controller.
+
+BLE connection interval is negotiated for lowest latency:
+
+| Controllers | Connection interval | Update rate |
+|-------------|---------------------|-------------|
+| 1           | 7.5 ms              | ~133 Hz     |
+| 2           | 11 – 15 ms          | ~67 – 91 Hz |
+
+When the Wi-Fi AP is active, BLE scanning pauses to reduce coexistence impact;
+existing controller connections and notifications are unaffected.
+
+### Extra Buttons
+
+Assistant and Capture buttons are exposed as a **boot keyboard + consumer-control**
+HID interface. Defaults:
+
+| Button    | Short press | Long press (1 s) |
+|-----------|-------------|------------------|
+| Assistant | F14         | Start Web UI     |
+| Capture   | PrintScreen | *(none)*         |
+
+All actions are remappable in the Web UI. 38 actions available: F13–F24,
+PrintScreen, Escape, Space, Enter, Tab, Backspace, Insert, Delete, Home, End,
+Page Up/Down, arrow keys, volume/mute, media playback, remote wake only, and
+Start Web UI.
+
+## Web UI
+
+Access at `http://192.168.4.1` when the AP is active. Provides:
+
+- BLE and USB connection status, firmware version
+- Per-controller battery, name, address, mouse mode status
+- Live button state and raw report bytes
+- Pairing controls and bonded controller list
+- Button action remapping, long-press duration, Web UI timeout
+- Firmware update upload (OTA) - untested
+- Reboot and disable-Web-UI
+
+The AP starts on fresh flash, when no bonds exist, or by holding
+**Assistant** button. It auto-disables after a configurable
+timeout (default 120 s) when a controller is connected.
+
+## USB Remote Wake
+
+When the host PC sleeps, pressing **Stadia, Assistant, Capture, or A** sends a
+remote wake signal via `tud_remote_wakeup()`. Requires BIOS/OS USB wake support. Not always working. 
+
+## LED Reference
+
+| Pattern                        | Meaning |
+|--------------------------------|---------|
+| White pulse                    | Booting |
+| Dim blue heartbeat             | Scanning, no controller connected |
+| Blue-yellow alternating        | Scanning + Wi-Fi AP on |
+| Green heartbeat                | 1 controller in gamepad mode |
+| Faster green heartbeat         | 2 controllers in gamepad mode |
+| Orange heartbeat               | At least 1 controller in mouse mode |
+| Dim purple heartbeat           | PC sleeping (USB suspended) |
+| Red pulsing                    | Error |
+| Purple/yellow alternating      | OTA firmware update |
+| Brief white flash              | Remote wake sent |
+
+## Architecture
+
+```
+Stadia BLE ──▶ ble_central.c ──▶ bridge.c ──▶ usb_xbox.c ──▶ Host PC (Xbox 360)
+                   │
+                   ├──▶ button_actions.c ──▶ hid_extra.c ──▶ Host PC (keyboard)
+                   │
+                   └──▶ mouse_mode.c ──▶ hid_mouse.c ──▶ Host PC (mouse, 125 Hz)
+
+Host PC (rumble) ──▶ xbox_dev.c ──▶ ble_central.c ──▶ Stadia BLE
+```
+
+## License
+
+[GNU General Public License v3.0](LICENSE)

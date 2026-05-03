@@ -1,29 +1,23 @@
 /*
- * ble_central.c — NimBLE GATT central for the Stadia controller.
- *
- * Discovery sequence (async / callback-driven):
- *   1. Scan (active) for advertisement name containing "Stadia"
- *   2. Connect
- *   3. Discover HID service (0x1812)
- *   4. Discover all Report characteristics (0x2A4D) within the service
- *   5. For each 0x2A4D chr: discover descriptors, read 0x2908 (Report Reference)
- *      to identify:
- *        - Input chr  (Report ID 3, type 1) → g_input_val_handle + g_input_cccd_handle
- *        - Output chr (Report ID 5, type 2) → g_output_val_handle
- *   6. Write 0x0001 to CCCD of input chr to enable notifications
- *   7. On BLE_GAP_EVENT_NOTIFY_RX: translate → push to ble_to_usb_queue
- *   8. Rumble: ble_npl_callout → ble_gattc_write_flat (Write-With-Response)
- *   9. On disconnect: 1 s esp_timer → restart scan
- *
- * Pairing: Just Works, bonding, Secure Connections (no MITM).
- * Bonds are persisted via CONFIG_BT_NIMBLE_NVS_PERSIST=y.
+ * ble_central.c - Slot-based NimBLE central for concurrent Stadia
+ * controllers. Each slot owns its BLE handles, parsed state, USB gamepad index,
+ * battery handle, and rumble target.
  */
 
 #include "ble_central.h"
+
 #include "bridge.h"
+#include "button_actions.h"
+#include "controller_manager.h"
+#include "dongle_config.h"
+#include "dongle_state.h"
+#include "mouse_mode.h"
+#include "web_server.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nimble/hci_common.h"
@@ -34,56 +28,238 @@
 #include "host/ble_store.h"
 #include "os/os_mbuf.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "BLE";
 
-/* ---- Global connection / GATT handles ------------------------------------ */
-
-static uint16_t g_conn_handle       = BLE_HS_CONN_HANDLE_NONE;
-static uint16_t g_hid_svc_start     = 0;
-static uint16_t g_hid_svc_end       = 0;
-static uint16_t g_input_val_handle  = 0;
-static uint16_t g_output_val_handle = 0;
-static uint16_t g_input_cccd_handle = 0;
-
-/* ---- Discovery state ----------------------------------------------------- */
-
 #define MAX_REPORT_CHRS 8
+#define BLE_SCAN_RETRY_US 1000000
+#define BLE_RESTART_SCAN_US 1000000
+#define BLE_BOOT_SCAN_DELAY_US 2000000
+#define BLE_BATTERY_POLL_US 60000000
 
-static struct {
+typedef enum {
+    CONTROLLER_SLOT_EMPTY,
+    CONTROLLER_SLOT_CONNECTING,
+    CONTROLLER_SLOT_DISCOVERING,
+    CONTROLLER_SLOT_ENCRYPTING,
+    CONTROLLER_SLOT_READY,
+    CONTROLLER_SLOT_DISCONNECTING,
+} controller_slot_state_t;
+
+typedef struct {
     uint16_t def_handle;
     uint16_t val_handle;
-} s_chrs[MAX_REPORT_CHRS];
+} report_chr_t;
 
-static int      s_chr_count   = 0;
-static int      s_cur_chr     = 0;
-static uint16_t s_cur_2908    = 0; // Report Reference descriptor handle for current chr
-static uint16_t s_cur_2902    = 0; // CCCD handle for current chr
+typedef struct {
+    bool used;
+    uint8_t slot_index;
+    uint32_t generation;
 
-/* ---- Rumble callout (must execute on NimBLE event queue) ----------------- */
+    ble_addr_t peer_addr;
+    char addr_str[DONGLE_ADDR_STR_LEN];
+    char name[DONGLE_CONTROLLER_NAME_LEN];
+    uint16_t conn_handle;
 
-static struct ble_npl_callout s_rumble_callout;
-static uint8_t                s_rumble_payload[4];
+    uint16_t hid_svc_start;
+    uint16_t hid_svc_end;
+    uint16_t input_val_handle;
+    uint16_t output_val_handle;
+    uint16_t input_cccd_handle;
 
-/* ---- Reconnect timer ----------------------------------------------------- */
+    report_chr_t report_chrs[MAX_REPORT_CHRS];
+    int chr_count;
+    int cur_chr;
+    uint16_t cur_2908;
+    uint16_t cur_2902;
 
+    uint16_t battery_svc_start;
+    uint16_t battery_svc_end;
+    uint16_t battery_val_handle;
+    int battery_percent;
+    bool battery_available;
+
+    stadia_controller_state_t stadia_state;
+    uint8_t usb_gamepad_index;
+    bool last_report_valid;
+    uint8_t last_xbox_report[DONGLE_XBOX_REPORT_SIZE];
+
+    controller_slot_state_t state;
+    struct ble_npl_callout rumble_callout;
+    uint8_t rumble_payload[DONGLE_RUMBLE_REPORT_SIZE];
+} controller_slot_t;
+
+static controller_slot_t s_slots[DONGLE_MAX_CONTROLLERS];
+static SemaphoreHandle_t s_slot_lock;
+static SemaphoreHandle_t s_scan_lock;
 static esp_timer_handle_t s_reconnect_timer;
-
-/* ---- Forward declarations ------------------------------------------------ */
+static esp_timer_handle_t s_battery_timer;
+static bool s_force_active_scan;
+static bool s_scan_paused;
 
 static void start_scan(void);
-static int  gap_event_fn(struct ble_gap_event *event, void *arg);
-static void process_next_chr(void);
+static int gap_event_fn(struct ble_gap_event *event, void *arg);
+static void process_next_chr(controller_slot_t *slot);
+static void rumble_callout_fn(struct ble_npl_event *ev);
+static int battery_read_cb(uint16_t conn_handle, const struct ble_gatt_error *err,
+                           struct ble_gatt_attr *attr, void *arg);
 
-/* ---- Reconnect timer callback -------------------------------------------- */
+static void addr_to_str(const ble_addr_t *addr, char *out, size_t out_len)
+{
+    snprintf(out, out_len, "%02X:%02X:%02X:%02X:%02X:%02X",
+             addr->val[5], addr->val[4], addr->val[3],
+             addr->val[2], addr->val[1], addr->val[0]);
+}
+
+static void init_slot_callout(controller_slot_t *slot)
+{
+    if (!slot) return;
+    ble_npl_callout_init(&slot->rumble_callout,
+                         nimble_port_get_dflt_eventq(),
+                         rumble_callout_fn, slot);
+}
+
+static bool addr_equal(const ble_addr_t *a, const ble_addr_t *b)
+{
+    return a && b && a->type == b->type && memcmp(a->val, b->val, sizeof(a->val)) == 0;
+}
+
+static controller_slot_t *slot_by_conn(uint16_t conn_handle)
+{
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        if (s_slots[i].used && s_slots[i].conn_handle == conn_handle) return &s_slots[i];
+    }
+    return NULL;
+}
+
+static controller_slot_t *slot_by_addr(const ble_addr_t *addr)
+{
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        if (s_slots[i].used && addr_equal(&s_slots[i].peer_addr, addr)) return &s_slots[i];
+    }
+    return NULL;
+}
+
+static controller_slot_t *slot_by_usb(uint8_t usb_gamepad_index)
+{
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        if (s_slots[i].used && s_slots[i].usb_gamepad_index == usb_gamepad_index) return &s_slots[i];
+    }
+    return NULL;
+}
+
+static bool slot_valid(controller_slot_t *slot, uint16_t conn_handle)
+{
+    return slot && slot->used && slot->conn_handle == conn_handle;
+}
+
+static int occupied_slots(void)
+{
+    int count = 0;
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        if (s_slots[i].used) count++;
+    }
+    return count;
+}
+
+static bool have_capacity(void)
+{
+    return occupied_slots() < DONGLE_MAX_CONTROLLERS;
+}
+
+static controller_slot_t *alloc_slot(const ble_addr_t *addr)
+{
+    if (s_slot_lock) xSemaphoreTake(s_slot_lock, portMAX_DELAY);
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        if (!s_slots[i].used) {
+            controller_slot_t *slot = &s_slots[i];
+            uint32_t generation = slot->generation + 1;
+            memset(slot, 0, sizeof(*slot));
+            init_slot_callout(slot);
+            slot->used = true;
+            slot->slot_index = i;
+            slot->generation = generation;
+            slot->peer_addr = *addr;
+            slot->conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            slot->usb_gamepad_index = i;
+            slot->battery_percent = -1;
+            slot->state = CONTROLLER_SLOT_CONNECTING;
+            addr_to_str(addr, slot->addr_str, sizeof(slot->addr_str));
+            snprintf(slot->name, sizeof(slot->name), "Stadia Controller");
+            dongle_state_controller_set_info(i, i, slot->addr_str, slot->name, false);
+            ESP_LOGI(TAG, "slot %u usb %u allocated addr=%s", i, i, slot->addr_str);
+            if (s_slot_lock) xSemaphoreGive(s_slot_lock);
+            return slot;
+        }
+    }
+    if (s_slot_lock) xSemaphoreGive(s_slot_lock);
+    return NULL;
+}
+
+static void clear_slot(controller_slot_t *slot)
+{
+    if (!slot) return;
+    if (s_slot_lock) xSemaphoreTake(s_slot_lock, portMAX_DELAY);
+    uint8_t idx = slot->slot_index;
+    uint8_t usb = slot->usb_gamepad_index;
+    uint32_t generation = slot->generation + 1;
+    ble_npl_callout_stop(&slot->rumble_callout);
+    memset(slot, 0, sizeof(*slot));
+    init_slot_callout(slot);
+    slot->slot_index = idx;
+    slot->usb_gamepad_index = usb;
+    slot->generation = generation;
+    slot->conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    slot->battery_percent = -1;
+    dongle_state_controller_clear(idx);
+    mouse_mode_reset(usb);
+    bridge_send_neutral(usb);
+    if (s_slot_lock) xSemaphoreGive(s_slot_lock);
+    ESP_LOGI(TAG, "slot %u usb %u cleared", idx, usb);
+}
+
+static void update_global_state_after_slot_change(void)
+{
+    int ready = 0;
+    int used = 0;
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        if (s_slots[i].used) {
+            used++;
+            if (s_slots[i].state == CONTROLLER_SLOT_READY) ready++;
+        }
+    }
+    if (ready > 0) {
+        dongle_state_set(web_server_is_active() ? DONGLE_STATE_CONNECTED_WEBUI_ACTIVE : DONGLE_STATE_CONNECTED);
+    } else if (used > 0) {
+        dongle_state_set(DONGLE_STATE_CONNECTING);
+    } else if (controller_manager_bond_count() == 0) {
+        dongle_state_set(DONGLE_STATE_NO_BOND_SETUP);
+    } else {
+        dongle_state_set(DONGLE_STATE_SCANNING);
+    }
+}
 
 static void reconnect_timer_cb(void *arg)
 {
+    (void)arg;
     start_scan();
 }
 
-/* ---- NimBLE host callbacks ----------------------------------------------- */
+static void battery_timer_cb(void *arg)
+{
+    (void)arg;
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        controller_slot_t *slot = &s_slots[i];
+        if (slot->used && slot->state == CONTROLLER_SLOT_READY && slot->battery_val_handle) {
+            int rc = ble_gattc_read(slot->conn_handle, slot->battery_val_handle, battery_read_cb, slot);
+            if (rc != 0 && rc != BLE_HS_EBUSY) {
+                ESP_LOGW(TAG, "slot %u battery poll start failed: %d", slot->slot_index, rc);
+            }
+        }
+    }
+}
 
 static void on_reset(int reason)
 {
@@ -93,370 +269,569 @@ static void on_reset(int reason)
 static void on_sync(void)
 {
     ESP_LOGI(TAG, "NimBLE synced");
-    start_scan();
-}
-
-/* ---- Scan ---------------------------------------------------------------- */
-
-static void start_scan(void)
-{
-    // Cancel any ongoing scan first — safe no-op if not scanning.
-    ble_gap_disc_cancel();
-
-    uint8_t own_addr_type;
-    ble_hs_id_infer_auto(0, &own_addr_type);
-
-    struct ble_gap_disc_params params = {
-        .passive           = 0, // active scan to get scan-response (name)
-        .filter_duplicates = 0, // must be 0: directed adv (no name) would poison the
-                                // hardware filter and suppress the subsequent general adv
-    };
-    int rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event_fn, NULL);
-    if (rc != 0) {
-        // Stack may still be busy (e.g. terminate not yet complete) — retry in 1 s.
-        ESP_LOGE(TAG, "ble_gap_disc failed: %d — retrying in 1 s", rc);
-        esp_timer_start_once(s_reconnect_timer, 1000000);
-    } else {
-        ESP_LOGI(TAG, "Scanning for Stadia controller…");
+    controller_manager_init();
+    web_server_request_start(false);
+    if (controller_manager_bond_count() == 0) {
+        dongle_state_set(DONGLE_STATE_NO_BOND_SETUP);
+        ESP_LOGI(TAG, "No bonded controllers; auto-scanning for any Stadia device");
+        ble_central_start_scan();
+        return;
     }
+    ESP_LOGI(TAG, "Starting bonded-controller scan in %u ms", (unsigned)(BLE_BOOT_SCAN_DELAY_US / 1000));
+    if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
+    if (s_reconnect_timer) esp_timer_start_once(s_reconnect_timer, BLE_BOOT_SCAN_DELAY_US);
 }
 
 static bool adv_contains_stadia(const uint8_t *data, uint8_t len)
 {
     struct ble_hs_adv_fields fields;
     if (ble_hs_adv_parse_fields(&fields, data, len) != 0) return false;
-    if (fields.name != NULL && fields.name_len >= 6) {
-        if (memcmp(fields.name, "Stadia", 6) == 0) return true;
-    }
-    return false;
+    return fields.name && fields.name_len >= 6 && memcmp(fields.name, "Stadia", 6) == 0;
 }
 
-/* ---- GATT discovery helpers --------------------------------------------- */
-
-static void subscribe(void);
-static int  svc_disc_fn (uint16_t conn_handle, const struct ble_gatt_error *err,
-                          const struct ble_gatt_svc *svc, void *arg);
-static int  chr_disc_fn (uint16_t conn_handle, const struct ble_gatt_error *err,
-                          const struct ble_gatt_chr *chr, void *arg);
-static int  dsc_disc_fn (uint16_t conn_handle, const struct ble_gatt_error *err,
-                          uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg);
-static int  report_ref_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
-                           struct ble_gatt_attr *attr, void *arg);
-static int  cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
-                           struct ble_gatt_attr *attr, void *arg);
-
-/* Step 1: service discovery callback */
-static int svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
-                        const struct ble_gatt_svc *svc, void *arg)
+static void start_scan(void)
 {
-    if (err->status == BLE_HS_EDONE) {
-        if (g_hid_svc_start == 0) {
-            ESP_LOGE(TAG, "HID service 0x1812 not found");
-            return 0;
-        }
-        ESP_LOGI(TAG, "HID service: 0x%04x–0x%04x", g_hid_svc_start, g_hid_svc_end);
-        s_chr_count = 0;
-        ble_gattc_disc_all_chrs(conn_handle, g_hid_svc_start, g_hid_svc_end,
-                                chr_disc_fn, NULL);
-        return 0;
+    ble_gap_disc_cancel();
+    if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    if (s_scan_paused) {
+        if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+        ESP_LOGI(TAG, "Not scanning: BLE discovery paused for Wi-Fi AP client");
+        return;
     }
-    if (err->status != 0) {
-        ESP_LOGE(TAG, "svc disc error: %d", err->status);
-        return 0;
-    }
-    g_hid_svc_start = svc->start_handle;
-    g_hid_svc_end   = svc->end_handle;
-    return 0;
-}
-
-/* Step 2: characteristic discovery — collect all 0x2A4D (Report) chars */
-static int chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
-                        const struct ble_gatt_chr *chr, void *arg)
-{
-    if (err->status == BLE_HS_EDONE) {
-        ESP_LOGI(TAG, "Found %d 0x2A4D characteristics", s_chr_count);
-        s_cur_chr = 0;
-        process_next_chr();
-        return 0;
-    }
-    if (err->status != 0) {
-        ESP_LOGE(TAG, "chr disc error: %d", err->status);
-        return 0;
-    }
-    if (chr->uuid.u.type == BLE_UUID_TYPE_16 &&
-        chr->uuid.u16.value == 0x2A4D &&
-        s_chr_count < MAX_REPORT_CHRS) {
-        s_chrs[s_chr_count].def_handle = chr->def_handle;
-        s_chrs[s_chr_count].val_handle = chr->val_handle;
-        s_chr_count++;
-    }
-    return 0;
-}
-
-/*
- * process_next_chr — iterate through collected 0x2A4D characteristics.
- * For each, discover its descriptors to find 0x2908 (Report Reference) and
- * 0x2902 (CCCD), then read the report reference to identify input vs output.
- */
-static void process_next_chr(void)
-{
-    if (s_cur_chr >= s_chr_count) {
-        // All characteristics processed
-        if (g_input_val_handle == 0 || g_output_val_handle == 0 ||
-            g_input_cccd_handle == 0) {
-            ESP_LOGE(TAG,
-                     "Incomplete handles — in=0x%04x out=0x%04x cccd=0x%04x — forcing reconnect",
-                     g_input_val_handle, g_output_val_handle, g_input_cccd_handle);
-            ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-            return;
-        }
-        subscribe();
+    if (!have_capacity()) {
+        if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+        ESP_LOGI(TAG, "Not scanning: controller capacity full (%u)", (unsigned)DONGLE_MAX_CONTROLLERS);
         return;
     }
 
-    // Descriptor range: [val_handle+1 … next chr def_handle−1] or svc end
-    uint16_t start = s_chrs[s_cur_chr].val_handle + 1;
-    uint16_t end   = (s_cur_chr + 1 < s_chr_count)
-                        ? (s_chrs[s_cur_chr + 1].def_handle - 1)
-                        : g_hid_svc_end;
-
-    if (start > end) {
-        s_cur_chr++;
-        process_next_chr();
+    uint8_t own_addr_type;
+    int rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    if (rc != 0) {
+        if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+        ESP_LOGW(TAG, "ble_hs_id_infer_auto failed: %d", rc);
         return;
     }
 
-    s_cur_2908 = 0;
-    s_cur_2902 = 0;
-    ble_gattc_disc_all_dscs(g_conn_handle, s_chrs[s_cur_chr].val_handle, end,
-                             dsc_disc_fn, NULL);
+    bool force_active = s_force_active_scan;
+    s_force_active_scan = false;
+    if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+
+    bool web_active = web_server_is_active_or_requested();
+    bool pairing = controller_manager_is_pairing_mode();
+    struct ble_gap_disc_params params = {
+        .itvl = web_active && !pairing && !force_active ? 800 : 16,
+        .window = web_active && !pairing && !force_active ? 16 : 16,
+        .passive = web_active && !pairing && !force_active,
+        .filter_duplicates = 0,
+    };
+    rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event_fn, NULL);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "ble_gap_disc failed: %d; retrying", rc);
+        if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
+        if (s_reconnect_timer) esp_timer_start_once(s_reconnect_timer, BLE_SCAN_RETRY_US);
+        return;
+    }
+    dongle_state_set(DONGLE_STATE_SCANNING);
+    ESP_LOGI(TAG, "Scanning capacity=%d/%u mode=%s itvl=%u window=%u",
+             occupied_slots(), (unsigned)DONGLE_MAX_CONTROLLERS,
+             params.passive ? "passive" : "active", params.itvl, params.window);
 }
 
-/* Step 3: descriptor discovery per characteristic */
-static int dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
-                        uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+void ble_central_start_scan(void)
 {
-    if (err->status == BLE_HS_EDONE) {
-        if (s_cur_2908 != 0) {
-            ble_gattc_read(conn_handle, s_cur_2908, report_ref_fn, NULL);
-        } else {
-            s_cur_chr++;
-            process_next_chr();
-        }
-        return 0;
-    }
-    if (err->status != 0) {
-        ESP_LOGE(TAG, "dsc disc error: %d", err->status);
-        s_cur_chr++;
-        process_next_chr();
-        return 0;
-    }
-    if (dsc->uuid.u.type == BLE_UUID_TYPE_16) {
-        if      (dsc->uuid.u16.value == 0x2908) s_cur_2908 = dsc->handle;
-        else if (dsc->uuid.u16.value == 0x2902) s_cur_2902 = dsc->handle;
-    }
-    return 0;
+    if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    s_scan_paused = false;
+    s_force_active_scan = true;
+    if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+    start_scan();
 }
 
-/* Step 4: read Report Reference (0x2908) → identify input / output chr */
-static int report_ref_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
-                          struct ble_gatt_attr *attr, void *arg)
+void ble_central_set_scan_paused(bool paused)
 {
-    if (err->status == 0 && attr != NULL) {
-        uint8_t buf[2];
-        uint16_t len = 0;
-        if (ble_hs_mbuf_to_flat(attr->om, buf, sizeof(buf), &len) == 0 && len == 2) {
-            uint8_t report_id   = buf[0];
-            uint8_t report_type = buf[1];
-            ESP_LOGI(TAG, "chr[%d] val=0x%04x id=%d type=%d",
-                     s_cur_chr, s_chrs[s_cur_chr].val_handle, report_id, report_type);
-            if (report_type == 1) { // Input
-                g_input_val_handle  = s_chrs[s_cur_chr].val_handle;
-                g_input_cccd_handle = s_cur_2902;
-            } else if (report_type == 2) { // Output
-                g_output_val_handle = s_chrs[s_cur_chr].val_handle;
-            }
-        }
+    if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    if (s_scan_paused == paused) {
+        if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+        return;
     }
-    s_cur_chr++;
-    process_next_chr();
-    return 0;
-}
-
-/* Step 5: initiate encryption — CCCD write happens in BLE_GAP_EVENT_ENC_CHANGE */
-static void subscribe(void)
-{
-    ESP_LOGI(TAG, "Initiating encryption before CCCD write: val=0x%04x cccd=0x%04x out=0x%04x",
-             g_input_val_handle, g_input_cccd_handle, g_output_val_handle);
-
-    // Stadia requires an encrypted link before accepting CCCD writes.
-    // Three cases for ble_gap_security_initiate():
-    //   rc == 0            → encryption in progress, write CCCD in BLE_GAP_EVENT_ENC_CHANGE
-    //   rc == BLE_HS_EALREADY → already encrypted (bond restored before discovery finished),
-    //                           ENC_CHANGE already fired so write CCCD now
-    //   rc == other        → unexpected failure, try CCCD anyway
-    int rc = ble_gap_security_initiate(g_conn_handle);
-    if (rc == 0) {
-        ESP_LOGI(TAG, "Encryption in progress — CCCD write deferred to ENC_CHANGE");
+    s_scan_paused = paused;
+    if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+    if (paused) {
+        ble_gap_disc_cancel();
+        if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
+        ESP_LOGI(TAG, "BLE discovery paused for Wi-Fi AP client");
     } else {
-        if (rc == BLE_HS_EALREADY) {
-            ESP_LOGI(TAG, "Link already encrypted — writing CCCD now");
-        } else {
-            ESP_LOGW(TAG, "Security initiate failed: %d — trying CCCD write anyway", rc);
-        }
-        uint8_t val[2] = {0x01, 0x00};
-        ble_gattc_write_flat(g_conn_handle, g_input_cccd_handle,
-                             val, sizeof(val), cccd_write_fn, NULL);
+        ESP_LOGI(TAG, "BLE discovery resumed after Wi-Fi AP client");
+        start_scan();
     }
 }
 
 static int cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
-                          struct ble_gatt_attr *attr, void *arg)
+                         struct ble_gatt_attr *attr, void *arg);
+
+static void subscribe(controller_slot_t *slot)
 {
+    if (!slot_valid(slot, slot->conn_handle)) return;
+    slot->state = CONTROLLER_SLOT_ENCRYPTING;
+    ESP_LOGI(TAG, "slot %u usb %u initiating security conn=%u in=0x%04x cccd=0x%04x out=0x%04x",
+             slot->slot_index, slot->usb_gamepad_index, slot->conn_handle,
+             slot->input_val_handle, slot->input_cccd_handle, slot->output_val_handle);
+    int rc = ble_gap_security_initiate(slot->conn_handle);
+    if (rc == 0) return;
+
+    if (rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "slot %u security initiate failed: %d; trying CCCD anyway", slot->slot_index, rc);
+    }
+    uint8_t val[2] = {0x01, 0x00};
+    ble_gattc_write_flat(slot->conn_handle, slot->input_cccd_handle,
+                         val, sizeof(val), cccd_write_fn, slot);
+}
+
+static int svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                       const struct ble_gatt_svc *svc, void *arg);
+static int chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                       const struct ble_gatt_chr *chr, void *arg);
+static int dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                       uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg);
+static int report_ref_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                         struct ble_gatt_attr *attr, void *arg);
+
+static int svc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                       const struct ble_gatt_svc *svc, void *arg)
+{
+    controller_slot_t *slot = arg;
+    if (!slot_valid(slot, conn_handle)) return 0;
+    if (err->status == BLE_HS_EDONE) {
+        if (!slot->hid_svc_start) {
+            ESP_LOGE(TAG, "slot %u HID service not found", slot->slot_index);
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            return 0;
+        }
+        ESP_LOGI(TAG, "slot %u HID service 0x%04x-0x%04x",
+                 slot->slot_index, slot->hid_svc_start, slot->hid_svc_end);
+        slot->chr_count = 0;
+        ble_gattc_disc_all_chrs(conn_handle, slot->hid_svc_start, slot->hid_svc_end,
+                                chr_disc_fn, slot);
+        return 0;
+    }
+    if (err->status != 0) {
+        ESP_LOGE(TAG, "slot %u svc disc error: %d", slot->slot_index, err->status);
+        return 0;
+    }
+    slot->hid_svc_start = svc->start_handle;
+    slot->hid_svc_end = svc->end_handle;
+    return 0;
+}
+
+static int chr_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                       const struct ble_gatt_chr *chr, void *arg)
+{
+    controller_slot_t *slot = arg;
+    if (!slot_valid(slot, conn_handle)) return 0;
+    if (err->status == BLE_HS_EDONE) {
+        ESP_LOGI(TAG, "slot %u found %d report characteristics", slot->slot_index, slot->chr_count);
+        slot->cur_chr = 0;
+        process_next_chr(slot);
+        return 0;
+    }
+    if (err->status != 0) {
+        ESP_LOGE(TAG, "slot %u chr disc error: %d", slot->slot_index, err->status);
+        return 0;
+    }
+    if (chr->uuid.u.type == BLE_UUID_TYPE_16 &&
+        chr->uuid.u16.value == 0x2A4D &&
+        slot->chr_count < MAX_REPORT_CHRS) {
+        slot->report_chrs[slot->chr_count].def_handle = chr->def_handle;
+        slot->report_chrs[slot->chr_count].val_handle = chr->val_handle;
+        slot->chr_count++;
+    }
+    return 0;
+}
+
+static void process_next_chr(controller_slot_t *slot)
+{
+    if (!slot_valid(slot, slot->conn_handle)) return;
+    if (slot->cur_chr >= slot->chr_count) {
+        if (!slot->input_val_handle || !slot->output_val_handle || !slot->input_cccd_handle) {
+            ESP_LOGE(TAG, "slot %u incomplete handles in=0x%04x out=0x%04x cccd=0x%04x",
+                     slot->slot_index, slot->input_val_handle,
+                     slot->output_val_handle, slot->input_cccd_handle);
+            ble_gap_terminate(slot->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            return;
+        }
+        subscribe(slot);
+        return;
+    }
+
+    uint16_t start = slot->report_chrs[slot->cur_chr].val_handle + 1;
+    uint16_t end = (slot->cur_chr + 1 < slot->chr_count)
+                       ? (slot->report_chrs[slot->cur_chr + 1].def_handle - 1)
+                       : slot->hid_svc_end;
+    if (start > end) {
+        slot->cur_chr++;
+        process_next_chr(slot);
+        return;
+    }
+    slot->cur_2908 = 0;
+    slot->cur_2902 = 0;
+    ble_gattc_disc_all_dscs(slot->conn_handle, slot->report_chrs[slot->cur_chr].val_handle,
+                            end, dsc_disc_fn, slot);
+}
+
+static int dsc_disc_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                       uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+    (void)chr_val_handle;
+    controller_slot_t *slot = arg;
+    if (!slot_valid(slot, conn_handle)) return 0;
+    if (err->status == BLE_HS_EDONE) {
+        if (slot->cur_2908) {
+            ble_gattc_read(conn_handle, slot->cur_2908, report_ref_fn, slot);
+        } else {
+            slot->cur_chr++;
+            process_next_chr(slot);
+        }
+        return 0;
+    }
+    if (err->status != 0) {
+        ESP_LOGE(TAG, "slot %u dsc disc error: %d", slot->slot_index, err->status);
+        slot->cur_chr++;
+        process_next_chr(slot);
+        return 0;
+    }
+    if (dsc->uuid.u.type == BLE_UUID_TYPE_16) {
+        if (dsc->uuid.u16.value == 0x2908) slot->cur_2908 = dsc->handle;
+        if (dsc->uuid.u16.value == 0x2902) slot->cur_2902 = dsc->handle;
+    }
+    return 0;
+}
+
+static int report_ref_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                         struct ble_gatt_attr *attr, void *arg)
+{
+    controller_slot_t *slot = arg;
+    if (!slot_valid(slot, conn_handle)) return 0;
+    if (err->status == 0 && attr) {
+        uint8_t buf[2];
+        uint16_t len = 0;
+        if (ble_hs_mbuf_to_flat(attr->om, buf, sizeof(buf), &len) == 0 && len == 2) {
+            uint8_t report_id = buf[0];
+            uint8_t report_type = buf[1];
+            ESP_LOGI(TAG, "slot %u chr[%d] val=0x%04x id=%u type=%u",
+                     slot->slot_index, slot->cur_chr,
+                     slot->report_chrs[slot->cur_chr].val_handle, report_id, report_type);
+            if (report_type == 1) {
+                slot->input_val_handle = slot->report_chrs[slot->cur_chr].val_handle;
+                slot->input_cccd_handle = slot->cur_2902;
+            } else if (report_type == 2) {
+                slot->output_val_handle = slot->report_chrs[slot->cur_chr].val_handle;
+            }
+        }
+    }
+    slot->cur_chr++;
+    process_next_chr(slot);
+    return 0;
+}
+
+static int battery_read_cb(uint16_t conn_handle, const struct ble_gatt_error *err,
+                           struct ble_gatt_attr *attr, void *arg)
+{
+    controller_slot_t *slot = arg ? arg : slot_by_conn(conn_handle);
+    if (!slot_valid(slot, conn_handle)) return 0;
+    if (err->status == 0 && attr && attr->om && OS_MBUF_PKTLEN(attr->om) >= 1) {
+        uint8_t pct = 0;
+        uint16_t len = 0;
+        if (ble_hs_mbuf_to_flat(attr->om, &pct, sizeof(pct), &len) == 0 && len >= 1) {
+            if (pct > 100) pct = 100;
+            slot->battery_percent = pct;
+            slot->battery_available = true;
+            dongle_state_controller_set_battery(slot->slot_index, pct);
+            ESP_LOGI(TAG, "slot %u battery level: %u%%", slot->slot_index, pct);
+        }
+    } else if (err->status != 0) {
+        ESP_LOGW(TAG, "slot %u battery read failed: %d", slot->slot_index, err->status);
+    }
+    return 0;
+}
+
+static int battery_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *err,
+                          const struct ble_gatt_chr *chr, void *arg)
+{
+    controller_slot_t *slot = arg;
+    if (!slot_valid(slot, conn_handle)) return 0;
+    if (err->status == 0 && chr) {
+        slot->battery_val_handle = chr->val_handle;
+        ESP_LOGI(TAG, "slot %u battery characteristic 0x%04x", slot->slot_index, chr->val_handle);
+        int rc = ble_gattc_read(conn_handle, slot->battery_val_handle, battery_read_cb, slot);
+        if (rc != 0) ESP_LOGW(TAG, "slot %u battery read start failed: %d", slot->slot_index, rc);
+    } else if (err->status == BLE_HS_EDONE && !slot->battery_val_handle) {
+        dongle_state_controller_set_battery(slot->slot_index, -1);
+        ESP_LOGI(TAG, "slot %u battery characteristic not found", slot->slot_index);
+    }
+    return 0;
+}
+
+static int battery_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *err,
+                          const struct ble_gatt_svc *svc, void *arg)
+{
+    controller_slot_t *slot = arg;
+    if (!slot_valid(slot, conn_handle)) return 0;
+    if (err->status == 0 && svc) {
+        slot->battery_svc_start = svc->start_handle;
+        slot->battery_svc_end = svc->end_handle;
+        ble_uuid16_t uuid = BLE_UUID16_INIT(0x2A19);
+        int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, svc->start_handle, svc->end_handle,
+                                             &uuid.u, battery_chr_cb, slot);
+        if (rc != 0) ESP_LOGW(TAG, "slot %u battery chr discovery failed to start: %d", slot->slot_index, rc);
+    } else if (err->status == BLE_HS_EDONE && !slot->battery_svc_start) {
+        dongle_state_controller_set_battery(slot->slot_index, -1);
+        ESP_LOGI(TAG, "slot %u battery service not found", slot->slot_index);
+    }
+    return 0;
+}
+
+static void battery_start(controller_slot_t *slot)
+{
+    if (!slot_valid(slot, slot->conn_handle)) return;
+    slot->battery_val_handle = 0;
+    slot->battery_available = false;
+    dongle_state_controller_set_battery(slot->slot_index, -1);
+    ble_uuid16_t uuid = BLE_UUID16_INIT(0x180F);
+    int rc = ble_gattc_disc_svc_by_uuid(slot->conn_handle, &uuid.u, battery_svc_cb, slot);
+    if (rc != 0) ESP_LOGW(TAG, "slot %u battery service discovery start failed: %d", slot->slot_index, rc);
+}
+
+static int cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
+                         struct ble_gatt_attr *attr, void *arg)
+{
+    (void)attr;
+    controller_slot_t *slot = arg;
+    if (!slot_valid(slot, conn_handle)) return 0;
     if (err->status == 0) {
-        ESP_LOGI(TAG, "Notifications enabled — controller ready");
+        slot->state = CONTROLLER_SLOT_READY;
+        dongle_state_controller_set_connected(slot->slot_index, true, true);
+        controller_manager_stop_pairing();
+        web_server_request_start(false);
+        update_global_state_after_slot_change();
+        ESP_LOGI(TAG, "slot %u usb %u ready conn=%u addr=%s",
+                 slot->slot_index, slot->usb_gamepad_index, conn_handle, slot->addr_str);
+        battery_start(slot);
+        if (have_capacity()) {
+            if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+            s_force_active_scan = true;
+            if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+            start_scan();
+        }
     } else {
-        ESP_LOGE(TAG, "CCCD write failed: %d — forcing reconnect", err->status);
+        ESP_LOGE(TAG, "slot %u CCCD write failed: %d", slot->slot_index, err->status);
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     return 0;
 }
 
-/* ---- Rumble callout (runs on NimBLE event queue) ------------------------- */
-
 static void rumble_callout_fn(struct ble_npl_event *ev)
 {
-    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE || g_output_val_handle == 0) return;
-    // Write-With-Response (not _no_rsp) — Stadia requires acknowledgement
-    ble_gattc_write_flat(g_conn_handle, g_output_val_handle,
-                         s_rumble_payload, 4, NULL, NULL);
+    controller_slot_t *slot = ble_npl_event_get_arg(ev);
+    if (!slot || !slot->used || slot->state != CONTROLLER_SLOT_READY || !slot->output_val_handle) return;
+    int rc = ble_gattc_write_flat(slot->conn_handle, slot->output_val_handle,
+                                  slot->rumble_payload, DONGLE_RUMBLE_REPORT_SIZE, NULL, NULL);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "slot %u usb %u rumble write start failed conn=%u rc=%d",
+                 slot->slot_index, slot->usb_gamepad_index, slot->conn_handle, rc);
+    } else {
+        ESP_LOGI(TAG, "slot %u usb %u rumble routed", slot->slot_index, slot->usb_gamepad_index);
+    }
 }
 
-void ble_central_send_rumble(const uint8_t *payload)
+void ble_central_send_rumble(uint8_t gamepad_index, const uint8_t *payload, size_t len)
 {
-    memcpy(s_rumble_payload, payload, 4);
-    ble_npl_callout_reset(&s_rumble_callout, 0);
+    if (!payload || len < DONGLE_RUMBLE_REPORT_SIZE) return;
+    if (s_slot_lock) xSemaphoreTake(s_slot_lock, portMAX_DELAY);
+    controller_slot_t *slot = slot_by_usb(gamepad_index);
+    if (!slot || slot->state != CONTROLLER_SLOT_READY) {
+        if (s_slot_lock) xSemaphoreGive(s_slot_lock);
+        ESP_LOGW(TAG, "Ignoring rumble for disconnected usb %u", gamepad_index);
+        return;
+    }
+    memcpy(slot->rumble_payload, payload, DONGLE_RUMBLE_REPORT_SIZE);
+    ble_npl_callout_reset(&slot->rumble_callout, 0);
+    if (s_slot_lock) xSemaphoreGive(s_slot_lock);
 }
 
-/* ---- GAP event handler --------------------------------------------------- */
+static bool is_bonded_addr(const ble_addr_t *addr)
+{
+    struct ble_store_key_sec key = {0};
+    key.peer_addr = *addr;
+    key.idx = 0;
+    struct ble_store_value_sec val;
+    return ble_store_read_peer_sec(&key, &val) == 0;
+}
 
 static int gap_event_fn(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {
-
     case BLE_GAP_EVENT_DISC: {
-        // Connect if the advertisement contains "Stadia" (name match, used for first
-        // pairing or pairing-mode reconnect), if it is directed advertising, or if it
-        // comes from a previously bonded device — the controller advertises with empty
-        // payload while its stack initialises, so we must not wait for the name.
-        bool is_directed = (event->disc.event_type == BLE_HCI_ADV_RPT_EVTYPE_DIR_IND);
-        bool is_stadia   = adv_contains_stadia(event->disc.data, event->disc.length_data);
-        bool is_bonded   = false;
-        if (!is_stadia && !is_directed) {
-            struct ble_store_key_sec key = { .peer_addr = event->disc.addr, .idx = 0 };
-            struct ble_store_value_sec val;
-            is_bonded = (ble_store_read_peer_sec(&key, &val) == 0);
-        }
-        if (is_stadia || is_directed || is_bonded) {
-            ESP_LOGI(TAG, "Stadia found (%s), connecting…",
-                     is_directed ? "directed adv" : is_bonded ? "bonded addr" : "name match");
+        if (!have_capacity()) {
             ble_gap_disc_cancel();
+            break;
+        }
+        if (slot_by_addr(&event->disc.addr)) break;
 
-            // Request a fast connection interval suitable for a gamepad (~10 ms).
-            static const struct ble_gap_conn_params conn_params = {
-                .scan_itvl      = 16,  // 10 ms
-                .scan_window    = 16,  // 10 ms
-                .itvl_min       = 6,   // 7.5 ms (units of 1.25 ms) — BLE minimum, ~133 Hz
-                .itvl_max       = 6,   // 7.5 ms
-                .latency        = 0,
-                .supervision_timeout = 200, // 2 s
-                .min_ce_len     = 0,
-                .max_ce_len     = 0,
-            };
+        bool is_directed = (event->disc.event_type == BLE_HCI_ADV_RPT_EVTYPE_DIR_IND);
+        bool is_stadia = adv_contains_stadia(event->disc.data, event->disc.length_data);
+        bool is_bonded = (!is_stadia && !is_directed) ? is_bonded_addr(&event->disc.addr) : false;
+        if (!is_stadia && !is_directed && !is_bonded) break;
+        if (!controller_manager_should_connect(&event->disc.addr, is_stadia, is_directed)) break;
 
-            uint8_t own_addr_type;
-            ble_hs_id_infer_auto(0, &own_addr_type);
-            ble_gap_connect(own_addr_type, &event->disc.addr,
-                            5000, &conn_params, gap_event_fn, NULL);
+        controller_slot_t *slot = alloc_slot(&event->disc.addr);
+        if (!slot) {
+            ESP_LOGW(TAG, "No free slot for discovered controller");
+            break;
+        }
+
+        ble_gap_disc_cancel();
+        dongle_state_set(DONGLE_STATE_CONNECTING);
+        static const struct ble_gap_conn_params conn_params = {
+            .scan_itvl = 16,
+            .scan_window = 16,
+            .itvl_min = DONGLE_MAX_CONTROLLERS > 1 ? 9 : 6,
+            .itvl_max = DONGLE_MAX_CONTROLLERS > 1 ? 12 : 6,
+            .latency = 0,
+            .supervision_timeout = 300,
+            .min_ce_len = 0,
+            .max_ce_len = 0,
+        };
+        uint8_t own_addr_type;
+        ble_hs_id_infer_auto(0, &own_addr_type);
+        int rc = ble_gap_connect(own_addr_type, &event->disc.addr, 5000,
+                                 &conn_params, gap_event_fn, slot);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "slot %u connect start failed: %d", slot->slot_index, rc);
+            clear_slot(slot);
+            if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+            s_force_active_scan = true;
+            if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+            start_scan();
+        } else {
+            ESP_LOGI(TAG, "slot %u usb %u connecting addr=%s",
+                     slot->slot_index, slot->usb_gamepad_index, slot->addr_str);
         }
         break;
     }
 
-    case BLE_GAP_EVENT_CONNECT:
+    case BLE_GAP_EVENT_CONNECT: {
+        controller_slot_t *slot = arg;
+        if (!slot || !slot->used) break;
         if (event->connect.status == 0) {
-            g_conn_handle       = event->connect.conn_handle;
-            g_hid_svc_start     = 0;
-            g_hid_svc_end       = 0;
-            g_input_val_handle  = 0;
-            g_output_val_handle = 0;
-            g_input_cccd_handle = 0;
-            s_chr_count         = 0;
-            ESP_LOGI(TAG, "Connected (handle=%d)", g_conn_handle);
+            slot->conn_handle = event->connect.conn_handle;
+            slot->state = CONTROLLER_SLOT_DISCOVERING;
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(slot->conn_handle, &desc) == 0) {
+                slot->peer_addr = desc.peer_id_addr;
+                addr_to_str(&slot->peer_addr, slot->addr_str, sizeof(slot->addr_str));
+                controller_manager_note_connected(&desc.peer_id_addr, slot->name);
+                dongle_state_controller_set_info(slot->slot_index, slot->usb_gamepad_index,
+                                                 slot->addr_str, slot->name, is_bonded_addr(&slot->peer_addr));
+            }
+            dongle_state_controller_set_connected(slot->slot_index, true, false);
+            ESP_LOGI(TAG, "slot %u usb %u connected addr=%s conn=%u",
+                     slot->slot_index, slot->usb_gamepad_index, slot->addr_str, slot->conn_handle);
 
             ble_uuid16_t hid_uuid = BLE_UUID16_INIT(0x1812);
-            ble_gattc_disc_svc_by_uuid(g_conn_handle, &hid_uuid.u,
-                                       svc_disc_fn, NULL);
+            ble_gattc_disc_svc_by_uuid(slot->conn_handle, &hid_uuid.u, svc_disc_fn, slot);
         } else {
-            ESP_LOGE(TAG, "Connect failed: %d", event->connect.status);
+            ESP_LOGW(TAG, "slot %u connect failed: %d", slot->slot_index, event->connect.status);
+            clear_slot(slot);
+            if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+            s_force_active_scan = true;
+            if (s_scan_lock) xSemaphoreGive(s_scan_lock);
             start_scan();
         }
         break;
+    }
 
-    case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGW(TAG, "Disconnected (reason=%d), retry in 1 s",
-                 event->disconnect.reason);
-        g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        bridge_send_neutral(); // release all buttons/axes on the USB host side
-        esp_timer_stop(s_reconnect_timer); // no-op if not running; prevents INVALID_STATE
-        esp_timer_start_once(s_reconnect_timer, 1000000 /* 1 s in µs */);
+    case BLE_GAP_EVENT_DISCONNECT: {
+        controller_slot_t *slot = slot_by_conn(event->disconnect.conn.conn_handle);
+        uint8_t usb = slot ? slot->usb_gamepad_index : 0;
+        ESP_LOGW(TAG, "slot %u usb %u disconnected reason=%d",
+                 slot ? slot->slot_index : 255, usb, event->disconnect.reason);
+        if (slot) {
+            slot->state = CONTROLLER_SLOT_DISCONNECTING;
+            bridge_send_neutral(usb);
+            clear_slot(slot);
+        }
+        controller_manager_note_disconnected();
+        update_global_state_after_slot_change();
+        if (occupied_slots() == 0) {
+            web_server_request_start(false);
+        }
+        if (s_scan_lock) xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+        s_force_active_scan = true;
+        if (s_scan_lock) xSemaphoreGive(s_scan_lock);
+        if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
+        if (s_reconnect_timer) esp_timer_start_once(s_reconnect_timer, BLE_RESTART_SCAN_US);
         break;
+    }
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
-        if (event->notify_rx.attr_handle != g_input_val_handle) break;
-
+        controller_slot_t *slot = slot_by_conn(event->notify_rx.conn_handle);
+        if (!slot || event->notify_rx.attr_handle != slot->input_val_handle) break;
         uint8_t raw[16];
         uint16_t len = 0;
-        if (ble_hs_mbuf_to_flat(event->notify_rx.om, raw, sizeof(raw), &len) != 0) {
-            ESP_LOGW(TAG, "mbuf extract failed");
+        if (ble_hs_mbuf_to_flat(event->notify_rx.om, raw, sizeof(raw), &len) != 0 || len < 9) {
+            ESP_LOGW(TAG, "slot %u malformed input len=%u", slot->slot_index, len);
             break;
         }
+        uint8_t xbox[DONGLE_XBOX_REPORT_SIZE];
+        stadia_controller_state_t state;
+        stadia_parse_state(raw, len, &state);
+        stadia_to_xbox360(raw, xbox);
+        slot->stadia_state = state;
+        memcpy(slot->last_xbox_report, xbox, sizeof(xbox));
+        slot->last_report_valid = true;
+        dongle_state_update_controller_reports(slot->slot_index, raw, len, &state, xbox);
+        button_actions_on_state(slot->usb_gamepad_index, &state);
 
-        #if DONGLE_DEBUG
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, raw, len, ESP_LOG_INFO);
-        #endif
-
-        // Stadia BLE sends 10 bytes: 9-byte report + 1 trailing byte.
-        // Report ID is NOT included (stripped per HOGP spec); use bytes [0..8].
-        if (len < 9) {
-            ESP_LOGW(TAG, "HID report too short: len=%d", len);
-            break;
-        }
-        const uint8_t *stadia = raw;
-
-        uint8_t xbox[20];
-        stadia_to_xbox360(stadia, xbox);
-        if (xQueueSendToBack(ble_to_usb_queue, xbox, 0) != pdTRUE) {
-            uint8_t dummy[20];
-            xQueueReceive(ble_to_usb_queue, dummy, 0);
-            xQueueSendToBack(ble_to_usb_queue, xbox, 0);
+        if (mouse_mode_is_active(slot->usb_gamepad_index)) {
+            ble_to_usb_msg_t neutral = {
+                .gamepad_index = slot->usb_gamepad_index,
+                .data = {0x00, 0x14},
+                .len = DONGLE_XBOX_REPORT_SIZE,
+            };
+            if (xQueueSendToBack(ble_to_usb_queue, &neutral, 0) != pdTRUE) {
+                ble_to_usb_msg_t dummy;
+                xQueueReceive(ble_to_usb_queue, &dummy, 0);
+                xQueueSendToBack(ble_to_usb_queue, &neutral, 0);
+            }
+            mouse_mode_cache_state(slot->usb_gamepad_index, &state);
+        } else {
+            ble_to_usb_msg_t msg = {
+                .gamepad_index = slot->usb_gamepad_index,
+                .len = DONGLE_XBOX_REPORT_SIZE,
+            };
+            memcpy(msg.data, xbox, sizeof(xbox));
+            if (xQueueSendToBack(ble_to_usb_queue, &msg, 0) != pdTRUE) {
+                ble_to_usb_msg_t dummy;
+                xQueueReceive(ble_to_usb_queue, &dummy, 0);
+                xQueueSendToBack(ble_to_usb_queue, &msg, 0);
+            }
         }
         break;
     }
 
-    case BLE_GAP_EVENT_ENC_CHANGE:
-        ESP_LOGI(TAG, "Encryption status: %d", event->enc_change.status);
-        if (event->enc_change.status == 0) {
-            if (g_input_cccd_handle != 0) {
-                // Link is now encrypted — safe to enable notifications
-                uint8_t val[2] = {0x01, 0x00};
-                ble_gattc_write_flat(event->enc_change.conn_handle, g_input_cccd_handle,
-                                     val, sizeof(val), cccd_write_fn, NULL);
-            }
-        } else {
-            ESP_LOGE(TAG, "Encryption failed: %d — forcing disconnect", event->enc_change.status);
+    case BLE_GAP_EVENT_ENC_CHANGE: {
+        controller_slot_t *slot = slot_by_conn(event->enc_change.conn_handle);
+        ESP_LOGI(TAG, "slot %u encryption status=%d",
+                 slot ? slot->slot_index : 255, event->enc_change.status);
+        if (!slot) break;
+        if (event->enc_change.status == 0 && slot->input_cccd_handle) {
+            uint8_t val[2] = {0x01, 0x00};
+            ble_gattc_write_flat(slot->conn_handle, slot->input_cccd_handle,
+                                 val, sizeof(val), cccd_write_fn, slot);
+        } else if (event->enc_change.status != 0) {
             ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         }
         break;
+    }
 
     default:
         break;
@@ -464,35 +839,47 @@ static int gap_event_fn(struct ble_gap_event *event, void *arg)
     return 0;
 }
 
-/* ---- NimBLE host task ---------------------------------------------------- */
-
 void nimble_host_task(void *param)
 {
+    (void)param;
     nimble_port_run();
     nimble_port_freertos_deinit();
 }
 
-/* ---- Init ---------------------------------------------------------------- */
-
 void ble_central_init(void)
 {
-    // Reconnect timer
-    esp_timer_create_args_t ta = {
+    s_slot_lock = xSemaphoreCreateMutex();
+    s_scan_lock = xSemaphoreCreateMutex();
+    configASSERT(s_slot_lock != NULL);
+    configASSERT(s_scan_lock != NULL);
+
+    esp_timer_create_args_t rt = {
         .callback = reconnect_timer_cb,
-        .name     = "ble_reconnect",
+        .name = "ble_reconnect",
     };
-    ESP_ERROR_CHECK(esp_timer_create(&ta, &s_reconnect_timer));
+    ESP_ERROR_CHECK(esp_timer_create(&rt, &s_reconnect_timer));
 
-    // Rumble callout (executes on NimBLE's default event queue)
-    ble_npl_callout_init(&s_rumble_callout,
-                         nimble_port_get_dflt_eventq(),
-                         rumble_callout_fn, NULL);
+    esp_timer_create_args_t bt = {
+        .callback = battery_timer_cb,
+        .name = "battery_poll",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&bt, &s_battery_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_battery_timer, BLE_BATTERY_POLL_US));
 
-    // NimBLE host configuration
-    ble_hs_cfg.reset_cb  = on_reset;
-    ble_hs_cfg.sync_cb   = on_sync;
-    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; // Just Works
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        s_slots[i].slot_index = i;
+        s_slots[i].usb_gamepad_index = i;
+        s_slots[i].conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        s_slots[i].battery_percent = -1;
+        ble_npl_callout_init(&s_slots[i].rumble_callout,
+                             nimble_port_get_dflt_eventq(),
+                             rumble_callout_fn, &s_slots[i]);
+    }
+
+    ble_hs_cfg.reset_cb = on_reset;
+    ble_hs_cfg.sync_cb = on_sync;
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
     ble_hs_cfg.sm_bonding = 1;
-    ble_hs_cfg.sm_mitm    = 0;
-    ble_hs_cfg.sm_sc      = 1; // Secure Connections
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_sc = 1;
 }

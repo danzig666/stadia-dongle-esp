@@ -36,7 +36,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 6.0.0
+    version: 6.0.1
 direct_dependencies:
 - espressif/esp_tinyusb
 manifest_hash: fbb1ad951a7263b811c6ade7686b3b397621c4ae63ef2de68226180248fcceb7

@@ -1,0 +1,44 @@
+menu "Stadia dongle"
+
+    menu "Dongle status RGB LED"
+
+        config DONGLE_LED_ENABLED
+            bool "Enable status RGB LED"
+            default y
+            help
+                Enable the low-priority status LED task. Disable this for boards
+                without an RGB LED or if GPIO 48 is used for other hardware.
+
+        choice DONGLE_LED_TYPE
+            prompt "Status LED type"
+            depends on DONGLE_LED_ENABLED
+            default DONGLE_LED_TYPE_ADDRESSABLE
+
+            config DONGLE_LED_TYPE_ADDRESSABLE
+                bool "Single addressable RGB LED (WS2812/SK6812-style)"
+
+            config DONGLE_LED_TYPE_NOOP
+                bool "No-op"
+        endchoice
+
+        config DONGLE_LED_GPIO
+            int "Addressable RGB LED GPIO"
+            depends on DONGLE_LED_ENABLED && DONGLE_LED_TYPE_ADDRESSABLE
+            default 48
+            range 0 48
+            help
+                GPIO used by the board's addressable RGB LED. Many ESP32-S3
+                dev boards use GPIO 48.
+
+        config DONGLE_LED_BRIGHTNESS
+            int "Status LED brightness"
+            depends on DONGLE_LED_ENABLED
+            default 32
+            range 1 255
+            help
+                Global RGB brightness scalar. 32 is intentionally conservative
+                for small onboard LEDs.
+
+    endmenu
+
+endmenu
