@@ -9,7 +9,7 @@ Forked from [Scalee/stadia-dongle](https://github.com/Scalee/stadia-dongle).
 ## Requirements
 
 - **ESP32-S3** module with native USB OTG
-- **4 MB** flash (default) or 16 MB — configurable via `sdkconfig.defaults`
+- **4 MB** flash (default) or 16 MB - configurable via `sdkconfig.defaults`
 - Optional: WS2812/SK6812 RGB LED on GPIO 48 (configurable in menuconfig)
 - [ESP-IDF v6.x](https://github.com/espressif/esp-idf)
 
@@ -51,7 +51,7 @@ Host the `docs/` folder and open `docs/index.html` in Chrome/Edge.
 3. Join Wi-Fi **`StadiaDongle-XXXX`** (open, no password).
 4. Open `http://192.168.4.1` (captive portal should redirect).
 5. Click **Start Pairing**, then put the controller in Bluetooth mode
-   (hold **Stadia + Y** until orange flash).
+   (hold **Stadia + Y** until orange flash). This is not really needed, it auto pairs available controllers.
 6. Once bonded, the dongle auto-connects on future boots.
 
 ## Controller Modes
@@ -90,8 +90,8 @@ mouse.
 | X              | Middle click                                       |
 | D-pad up/down  | Scroll wheel (±1 per press)                        |
 | Right stick Y  | Analog scroll wheel                                |
-| LT (hold)      | Precision mode — cursor speed ÷ 3                  |
-| RT (hold)      | Fast mode — cursor speed × 2                       |
+| LT (hold)      | Precision mode - cursor speed ÷ 3                  |
+| RT (hold)      | Fast mode - cursor speed × 2                       |
 | Stadia / LB / RB / LS / RS / Menu / Options | Inactive (neutral Xbox reports) |
 
 Mouse reports are driven by a 125 Hz hardware timer for smooth, jitter-free movement.
