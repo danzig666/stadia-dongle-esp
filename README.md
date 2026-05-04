@@ -13,6 +13,13 @@ Forked from [Scalee/stadia-dongle](https://github.com/Scalee/stadia-dongle).
 - Optional: WS2812/SK6812 RGB LED on GPIO 48 (configurable in menuconfig)
 - [ESP-IDF v6.x](https://github.com/espressif/esp-idf)
 
+## Flashing
+No software needed: use the web installer in Chrome or Edge.
+
+[danzig666.github.io/stadia-dongle-esp](https://danzig666.github.io/stadia-dongle-esp/)
+
+Connect the ESP32-S3 via the COM/UART USB port, click Install, then move it to the native USB port after flashing.
+
 ## Build
 
 ```sh
