@@ -33,6 +33,8 @@
 
 static const char *TAG = "BLE";
 
+static bool s_nimble_synced;
+
 #define MAX_REPORT_CHRS 8
 #define BLE_SCAN_RETRY_US 1000000
 #define BLE_RESTART_SCAN_US 1000000
@@ -269,6 +271,7 @@ static void on_reset(int reason)
 static void on_sync(void)
 {
     ESP_LOGI(TAG, "NimBLE synced");
+    s_nimble_synced = true;
     controller_manager_init();
     web_server_request_start(false);
     if (controller_manager_bond_count() == 0) {
@@ -361,7 +364,7 @@ void ble_central_set_scan_paused(bool paused)
         ESP_LOGI(TAG, "BLE discovery paused for Wi-Fi AP client");
     } else {
         ESP_LOGI(TAG, "BLE discovery resumed after Wi-Fi AP client");
-        start_scan();
+        if (s_nimble_synced) ble_central_start_scan();
     }
 }
 

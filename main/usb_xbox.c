@@ -14,6 +14,7 @@
 #include "xbox_dev.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "tinyusb.h"
 #include "tusb.h"
 #include "freertos/FreeRTOS.h"
@@ -25,6 +26,8 @@ static SemaphoreHandle_t s_flag_lock;
 static bool s_last_polled_suspended;
 static volatile bool s_resync_reports_requested;
 static volatile bool s_reenumerate_requested;
+static int64_t s_last_xfer_done_us;
+static bool s_detected_asleep;
 
 static void set_resync_requested(bool val)
 {
@@ -294,6 +297,14 @@ void usb_xbox_task(void *arg)
                 have_report[i] = false;
                 last_sent[i] = xTaskGetTickCount();
                 busy_since[i] = 0;
+                if (res == 1) {
+                    s_last_xfer_done_us = esp_timer_get_time();
+                    if (s_detected_asleep) {
+                        s_detected_asleep = false;
+                        dongle_state_set_usb_suspended(false);
+                        web_server_notify_usb_suspend(false);
+                    }
+                }
             } else if (res == 0) {
                 TickType_t now = xTaskGetTickCount();
                 if (busy_since[i] == 0) busy_since[i] = now;
@@ -304,6 +315,17 @@ void usb_xbox_task(void *arg)
                     set_resync_requested(true);
                 }
             }
+        }
+
+        // Transfer-based sleep detection: if no Xbox transfer completed for
+        // 3 seconds, the host is likely asleep (TinyUSB suspend callbacks are
+        // unreliable on ESP32-S3 — many PCs don't signal USB suspend properly).
+        if (!s_detected_asleep && tud_ready() &&
+            esp_timer_get_time() - s_last_xfer_done_us > 3000000) {
+            s_detected_asleep = true;
+            ESP_LOGI(TAG, "USB host asleep (no xfer ack for 3 s)");
+            dongle_state_set_usb_suspended(true);
+            web_server_notify_usb_suspend(true);
         }
 
         // Keepalive: if no Xbox report was sent for 1000 ms, send a neutral
@@ -317,7 +339,10 @@ void usb_xbox_task(void *arg)
                 neutral[0] = 0x00;
                 neutral[1] = 0x14;
                 int res = xbox_send_report(i, neutral, sizeof(neutral));
-                if (res == 1) last_sent[i] = now;
+                if (res == 1) {
+                    last_sent[i] = now;
+                    s_last_xfer_done_us = esp_timer_get_time();
+                }
             }
         }
     }
@@ -327,6 +352,8 @@ void usb_xbox_init(void)
 {
     s_flag_lock = xSemaphoreCreateMutex();
     configASSERT(s_flag_lock != NULL);
+    s_last_xfer_done_us = esp_timer_get_time();
+    s_detected_asleep = false;
 
     tinyusb_config_t cfg = {
         .port = TINYUSB_PORT_FULL_SPEED_0,

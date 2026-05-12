@@ -43,6 +43,8 @@ static int64_t s_last_sta_join_us;
 static int64_t s_last_ip_assigned_us;
 static uint8_t s_last_sta_mac[6];
 static bool s_dhcp_wait_logged;
+static int s_dhcp_retry_count;
+static bool s_deadline_set;
 static volatile bool s_dhcp_ensure_requested;
 static volatile bool s_ble_scan_pause_requested;
 static volatile bool s_ble_scan_resume_requested;
@@ -96,6 +98,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             ble_central_set_scan_paused(false);
             s_ble_scan_resume_requested = true;
         }
+        esp_wifi_deauth_sta(ev->aid);
         ESP_LOGW("WEB", "AP station disconnected " MACSTR " aid=%d reason=%d",
                  MAC2STR(ev->mac), ev->aid, ev->reason);
     }
@@ -507,9 +510,12 @@ static void update_webui_deadline(void)
     }
 
     if (!any_controller_connected()) {
+        s_deadline_set = false;
         dongle_state_set_webui(true, 0);
         return;
     }
+
+    if (s_deadline_set) return;
 
     dongle_config_t cfg;
     config_store_get(&cfg);
@@ -517,12 +523,18 @@ static void update_webui_deadline(void)
     if (timeout_ms < 15000) timeout_ms = 15000;
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     dongle_state_set_webui(true, deadline);
+    s_deadline_set = true;
 }
 
 static void web_monitor_task(void *arg)
 {
     (void)arg;
+    int32_t deadline_ticks = 0;
     while (1) {
+        if (++deadline_ticks >= 10) {
+            deadline_ticks = 0;
+            update_webui_deadline();
+        }
         if (s_start_requested) {
             bool explicit_request = s_start_explicit;
             s_start_requested = false;
@@ -545,6 +557,19 @@ static void web_monitor_task(void *arg)
             esp_timer_get_time() - s_last_sta_join_us > 10000000) {
             s_dhcp_wait_logged = true;
             log_dhcp_wait();
+            esp_netif_dhcps_stop(s_ap_netif);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_netif_dhcps_start(s_ap_netif);
+            s_dhcp_wait_logged = false;
+            s_last_sta_join_us = esp_timer_get_time();
+            s_dhcp_retry_count++;
+            if (s_dhcp_retry_count > 2) {
+                ESP_LOGW("WEB", "DHCP restart retries exhausted; next attempt on reconnect");
+                s_dhcp_retry_count = 0;
+                s_dhcp_wait_logged = true;
+            }
+        } else {
+            s_dhcp_retry_count = 0;
         }
         dongle_config_t cfg;
         config_store_get(&cfg);
@@ -589,8 +614,12 @@ void web_server_start(bool explicit_request)
         s_netif_created = true;
     }
     if (!s_wifi_started) {
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        static bool wifi_ever_inited;
+        if (!wifi_ever_inited) {
+            wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+            ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+            wifi_ever_inited = true;
+        }
         esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
         if (!s_wifi_event_registered) {
             ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
@@ -607,8 +636,8 @@ void web_server_start(bool explicit_request)
         wifi_config_t ap = {0};
         snprintf((char *)ap.ap.ssid, sizeof(ap.ap.ssid), "StadiaDongle-%02X%02X", mac[4], mac[5]);
         ap.ap.ssid_len = strlen((char *)ap.ap.ssid);
-        ap.ap.channel = 6;
-        ap.ap.max_connection = 1;
+        ap.ap.channel = 1;
+        ap.ap.max_connection = 2;
         ap.ap.authmode = WIFI_AUTH_OPEN;
         ap.ap.ssid_hidden = 0;
         ap.ap.beacon_interval = 100;
@@ -616,9 +645,17 @@ void web_server_start(bool explicit_request)
         ap.ap.pmf_cfg.required = false;
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
         /*
+         * Cancel BLE scanning and delay for coexistence handover before
+         * starting the AP.  Without this, ESP32-S3's shared RF path causes
+         * the AP to miss authentication frames from clients.
+         */
+        ble_central_set_scan_paused(true);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+        /*
          * Use ESP-IDF's default AP protocol set. Forcing 11b/g made some
          * clients associate but never complete DHCP.
-        */
+         */
         ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
         ESP_ERROR_CHECK(esp_wifi_start());
@@ -631,6 +668,9 @@ void web_server_start(bool explicit_request)
         }
         ESP_LOGI("WEB", "Setup AP started: SSID=%s auth=open url=http://192.168.4.1", ap.ap.ssid);
         s_wifi_started = true;
+        if (s_sta_count == 0) {
+            ble_central_set_scan_paused(false);
+        }
     }
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -677,12 +717,12 @@ void web_server_stop(void)
     s_sta_count = 0;
     s_dhcp_wait_logged = false;
     s_dhcp_ensure_requested = false;
+    s_deadline_set = false;
     s_ble_scan_pause_requested = false;
     s_ble_scan_resume_requested = true;
     if (s_wifi_started) {
         if (s_ap_netif) esp_netif_dhcps_stop(s_ap_netif);
         esp_wifi_stop();
-        esp_wifi_deinit();
         esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
         s_wifi_started = false;
     }
