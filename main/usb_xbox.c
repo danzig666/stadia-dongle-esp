@@ -21,6 +21,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include <string.h>
+
 static const char *TAG = "USB";
 static SemaphoreHandle_t s_flag_lock;
 static bool s_last_polled_suspended;
@@ -274,6 +276,8 @@ void usb_xbox_task(void *arg)
     bool have_report[DONGLE_MAX_CONTROLLERS] = {0};
     TickType_t busy_since[DONGLE_MAX_CONTROLLERS] = {0};
     TickType_t last_sent[DONGLE_MAX_CONTROLLERS] = {0};
+    uint8_t last_report[DONGLE_MAX_CONTROLLERS][DONGLE_XBOX_REPORT_SIZE];
+    bool last_report_valid[DONGLE_MAX_CONTROLLERS] = {0};
 
     while (1) {
         if (xQueueReceive(ble_to_usb_queue, &msg, pdMS_TO_TICKS(2)) == pdTRUE) {
@@ -298,6 +302,8 @@ void usb_xbox_task(void *arg)
                 last_sent[i] = xTaskGetTickCount();
                 busy_since[i] = 0;
                 if (res == 1) {
+                    memcpy(last_report[i], pending[i].data, DONGLE_XBOX_REPORT_SIZE);
+                    last_report_valid[i] = true;
                     s_last_xfer_done_us = esp_timer_get_time();
                     if (s_detected_asleep) {
                         s_detected_asleep = false;
@@ -328,17 +334,14 @@ void usb_xbox_task(void *arg)
             web_server_notify_usb_suspend(true);
         }
 
-        // Keepalive: if no Xbox report was sent for 1000 ms, send a neutral
-        // one to clear any stale Guide button state that Windows might latch.
+        // Keepalive: replay the last known report every 1000 ms to keep
+        // Windows from thinking the controller disappeared.  Replaying the
+        // actual last state preserves held buttons (fixes long-press).
         TickType_t now = xTaskGetTickCount();
         for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
             if (!have_report[i] && (now - last_sent[i]) > pdMS_TO_TICKS(1000) &&
-                tud_ready() && !tud_suspended()) {
-                uint8_t neutral[DONGLE_XBOX_REPORT_SIZE];
-                memset(neutral, 0, sizeof(neutral));
-                neutral[0] = 0x00;
-                neutral[1] = 0x14;
-                int res = xbox_send_report(i, neutral, sizeof(neutral));
+                tud_ready() && !tud_suspended() && last_report_valid[i]) {
+                int res = xbox_send_report(i, last_report[i], DONGLE_XBOX_REPORT_SIZE);
                 if (res == 1) {
                     last_sent[i] = now;
                     s_last_xfer_done_us = esp_timer_get_time();
