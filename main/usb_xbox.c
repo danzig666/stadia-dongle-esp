@@ -76,26 +76,26 @@ static void enqueue_latest_reports(void)
     dongle_state_get_status(&st);
     for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
         const dongle_controller_status_t *c = &st.controllers[i];
-        if (!c->connected && !c->xbox_valid) continue;
 
-        ble_to_usb_msg_t msg = {
-            .gamepad_index = c->usb_gamepad_index,
-            .len = DONGLE_XBOX_REPORT_SIZE,
-        };
-        ble_to_usb_msg_t neutral = {
-            .gamepad_index = c->usb_gamepad_index,
-            .data = {0x00, 0x14},
-            .len = DONGLE_XBOX_REPORT_SIZE,
-        };
-        xQueueSendToBack(ble_to_usb_queue, &neutral, 0);
+        /*
+         * Every advertised Xbox interface needs an explicit state after USB
+         * attach/resume, including interfaces with no BLE controller.  Mouse
+         * mode intentionally keeps the Xbox side neutral.
+         */
+        bridge_send_neutral(c->usb_gamepad_index);
 
-        if (c->xbox_valid) {
+        if (c->connected && c->xbox_valid && !c->mouse_mode) {
+            ble_to_usb_msg_t msg = {
+                .gamepad_index = c->usb_gamepad_index,
+                .len = DONGLE_XBOX_REPORT_SIZE,
+            };
             memcpy(msg.data, c->xbox, DONGLE_XBOX_REPORT_SIZE);
-        } else {
-            msg.data[0] = 0x00;
-            msg.data[1] = 0x14;
+            if (xQueueSendToBack(ble_to_usb_queue, &msg, 0) != pdTRUE) {
+                ble_to_usb_msg_t dummy;
+                xQueueReceive(ble_to_usb_queue, &dummy, 0);
+                xQueueSendToBack(ble_to_usb_queue, &msg, 0);
+            }
         }
-        xQueueSendToBack(ble_to_usb_queue, &msg, 0);
     }
 }
 
@@ -279,11 +279,26 @@ void usb_xbox_task(void *arg)
     uint8_t last_report[DONGLE_MAX_CONTROLLERS][DONGLE_XBOX_REPORT_SIZE];
     bool last_report_valid[DONGLE_MAX_CONTROLLERS] = {0};
 
+    /* Start every virtual gamepad in a known neutral state. */
+    for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
+        pending[i].gamepad_index = i;
+        pending[i].data[0] = 0x00;
+        pending[i].data[1] = 0x14;
+        pending[i].len = DONGLE_XBOX_REPORT_SIZE;
+        have_report[i] = true;
+        memcpy(last_report[i], pending[i].data, DONGLE_XBOX_REPORT_SIZE);
+        last_report_valid[i] = true;
+    }
+
     while (1) {
         if (xQueueReceive(ble_to_usb_queue, &msg, pdMS_TO_TICKS(2)) == pdTRUE) {
             if (msg.gamepad_index < DONGLE_MAX_CONTROLLERS) {
                 pending[msg.gamepad_index] = msg;
                 have_report[msg.gamepad_index] = true;
+                if (msg.len >= DONGLE_XBOX_REPORT_SIZE) {
+                    memcpy(last_report[msg.gamepad_index], msg.data, DONGLE_XBOX_REPORT_SIZE);
+                    last_report_valid[msg.gamepad_index] = true;
+                }
             }
         }
 
@@ -291,6 +306,10 @@ void usb_xbox_task(void *arg)
             if (msg.gamepad_index < DONGLE_MAX_CONTROLLERS) {
                 pending[msg.gamepad_index] = msg;
                 have_report[msg.gamepad_index] = true;
+                if (msg.len >= DONGLE_XBOX_REPORT_SIZE) {
+                    memcpy(last_report[msg.gamepad_index], msg.data, DONGLE_XBOX_REPORT_SIZE);
+                    last_report_valid[msg.gamepad_index] = true;
+                }
             }
         }
 
@@ -302,8 +321,6 @@ void usb_xbox_task(void *arg)
                 last_sent[i] = xTaskGetTickCount();
                 busy_since[i] = 0;
                 if (res == 1) {
-                    memcpy(last_report[i], pending[i].data, DONGLE_XBOX_REPORT_SIZE);
-                    last_report_valid[i] = true;
                     s_last_xfer_done_us = esp_timer_get_time();
                     if (s_detected_asleep) {
                         s_detected_asleep = false;
@@ -334,9 +351,10 @@ void usb_xbox_task(void *arg)
             web_server_notify_usb_suspend(true);
         }
 
-        // Keepalive: replay the last known report every 1000 ms to keep
+        // Keepalive: replay the latest desired report every 1000 ms to keep
         // Windows from thinking the controller disappeared.  Replaying the
-        // actual last state preserves held buttons (fixes long-press).
+        // desired state preserves held buttons while ensuring a disconnect
+        // neutral received during USB suspend replaces any stale held state.
         TickType_t now = xTaskGetTickCount();
         for (uint8_t i = 0; i < DONGLE_MAX_CONTROLLERS; i++) {
             if (!have_report[i] && (now - last_sent[i]) > pdMS_TO_TICKS(1000) &&

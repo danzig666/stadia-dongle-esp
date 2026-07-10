@@ -169,7 +169,9 @@ static void button_actions_task(void *arg)
 
             dongle_status_t status;
             dongle_state_get_status(&status);
-            if (status.usb_suspended && (st.a || st.stadia || st.assistant || st.capture)) {
+            /* Keep Stadia/Guide available for the controller's own power-off
+               gesture without immediately waking the suspended host. */
+            if (status.usb_suspended && (st.a || st.assistant || st.capture)) {
                 hid_extra_remote_wakeup();
             }
 

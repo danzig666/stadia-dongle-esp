@@ -5,4 +5,5 @@ idf_component_register(
          "hid_extra.c" "hid_mouse.c" "button_actions.c" "mouse_mode.c"
     INCLUDE_DIRS "."
     REQUIRES nvs_flash bt esp_timer driver esp_driver_rmt esp_wifi esp_netif esp_http_server app_update esp_app_format esp_coex
+    EMBED_TXTFILES "index.html"
 )

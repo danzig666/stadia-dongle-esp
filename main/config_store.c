@@ -67,30 +67,38 @@ void config_store_get(dongle_config_t *out)
     if (s_cfg_lock) xSemaphoreGive(s_cfg_lock);
 }
 
-void config_store_set(const dongle_config_t *cfg)
+esp_err_t config_store_set(const dongle_config_t *cfg)
 {
-    if (!cfg) return;
-    if (s_cfg_lock) xSemaphoreTake(s_cfg_lock, portMAX_DELAY);
-    s_cfg = *cfg;
-    s_cfg.schema_version = CFG_SCHEMA;
-    if (s_cfg_lock) xSemaphoreGive(s_cfg_lock);
+    if (!cfg) return ESP_ERR_INVALID_ARG;
+
+    dongle_config_t next = *cfg;
+    next.schema_version = CFG_SCHEMA;
     nvs_handle_t nvs;
-    if (nvs_open(CFG_NS, NVS_READWRITE, &nvs) == ESP_OK) {
-        esp_err_t err = nvs_set_blob(nvs, CFG_KEY, &s_cfg, sizeof(s_cfg));
-        if (err == ESP_OK) err = nvs_commit(nvs);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Saved keymap: assistant short=%s long=%s capture short=%s long=%s",
-                     config_store_action_name(s_cfg.assistant_short_action),
-                     config_store_action_name(s_cfg.assistant_long_action),
-                     config_store_action_name(s_cfg.capture_short_action),
-                     config_store_action_name(s_cfg.capture_long_action));
-        } else {
-            ESP_LOGW(TAG, "Failed to save config: %s", esp_err_to_name(err));
-        }
-        nvs_close(nvs);
-    } else {
-        ESP_LOGW(TAG, "Failed to open NVS namespace %s", CFG_NS);
+    esp_err_t err = nvs_open(CFG_NS, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS namespace %s: %s", CFG_NS, esp_err_to_name(err));
+        return err;
     }
+
+    err = nvs_set_blob(nvs, CFG_KEY, &next, sizeof(next));
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save config: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* Publish the new runtime configuration only after it is durable. */
+    if (s_cfg_lock) xSemaphoreTake(s_cfg_lock, portMAX_DELAY);
+    s_cfg = next;
+    if (s_cfg_lock) xSemaphoreGive(s_cfg_lock);
+
+    ESP_LOGI(TAG, "Saved keymap: assistant short=%s long=%s capture short=%s long=%s",
+             config_store_action_name(next.assistant_short_action),
+             config_store_action_name(next.assistant_long_action),
+             config_store_action_name(next.capture_short_action),
+             config_store_action_name(next.capture_long_action));
+    return ESP_OK;
 }
 
 const char *config_store_action_name(uint8_t action)

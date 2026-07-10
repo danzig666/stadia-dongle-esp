@@ -1,5 +1,4 @@
 #include "web_server.h"
-#include "index_html.h"
 
 #include "ble_central.h"
 #include "bridge.h"
@@ -36,20 +35,24 @@ static bool s_wifi_started;
 static bool s_netif_created;
 static volatile bool s_start_requested;
 static volatile bool s_start_explicit;
+static volatile bool s_stop_requested;
 static bool s_wifi_event_registered;
 static bool s_ip_event_registered;
-static int s_sta_count;
+static volatile int s_sta_count;
 static int64_t s_last_sta_join_us;
 static int64_t s_last_ip_assigned_us;
 static uint8_t s_last_sta_mac[6];
 static bool s_dhcp_wait_logged;
 static int s_dhcp_retry_count;
-static bool s_deadline_set;
+static volatile bool s_deadline_set;
 static volatile bool s_dhcp_ensure_requested;
 static volatile bool s_ble_scan_pause_requested;
 static volatile bool s_ble_scan_resume_requested;
 static volatile bool s_ap_stopped_for_suspend;
 static volatile bool s_usb_suspended;
+
+extern const char s_index_html_start[] asm("_binary_index_html_start");
+extern const char s_index_html_end[] asm("_binary_index_html_end");
 
 static void parse_form_value(const char *body, const char *key, char *out, size_t out_len);
 static void update_webui_deadline(void);
@@ -142,7 +145,8 @@ static esp_err_t send_text(httpd_req_t *req, const char *text, const char *type)
 static esp_err_t index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, s_index_html, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, s_index_html_start,
+                           (ssize_t)(s_index_html_end - s_index_html_start - 1));
 }
 
 static esp_err_t status_handler(httpd_req_t *req)
@@ -385,52 +389,103 @@ static void parse_form_value(const char *body, const char *key, char *out, size_
     *out = '\0';
 }
 
+static bool parse_action_value(const char *body, const char *key, uint8_t *out)
+{
+    char value[40];
+    parse_form_value(body, key, value, sizeof(value));
+    if (!value[0]) return false;
+    uint8_t action = config_store_action_from_name(value);
+    if (action == DONGLE_ACTION_NONE && strcmp(value, "none") != 0) return false;
+    *out = action;
+    return true;
+}
+
+static esp_err_t receive_request_body(httpd_req_t *req, char *body, size_t body_size)
+{
+    if (!req || !body || body_size < 2 || req->content_len <= 0 ||
+        (size_t)req->content_len >= body_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    size_t received = 0;
+    int timeout_count = 0;
+    while (received < (size_t)req->content_len) {
+        int got = httpd_req_recv(req, body + received,
+                                 (size_t)req->content_len - received);
+        if (got == HTTPD_SOCK_ERR_TIMEOUT && timeout_count++ < 2) continue;
+        if (got <= 0) return ESP_FAIL;
+        timeout_count = 0;
+        received += (size_t)got;
+    }
+    body[received] = '\0';
+    return ESP_OK;
+}
+
 static esp_err_t keymap_post_handler(httpd_req_t *req)
 {
     char body[384] = {0};
-    int got = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (got < 0) return ESP_FAIL;
+    esp_err_t err = receive_request_body(req, body, sizeof(body));
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Invalid or incomplete configuration request");
+    }
+
     dongle_config_t cfg;
     config_store_get(&cfg);
     char v[40];
-    parse_form_value(body, "assistant_short", v, sizeof(v));
-    cfg.assistant_short_action = config_store_action_from_name(v);
-    parse_form_value(body, "assistant_long", v, sizeof(v));
-    cfg.assistant_long_action = config_store_action_from_name(v);
-    parse_form_value(body, "capture_short", v, sizeof(v));
-    cfg.capture_short_action = config_store_action_from_name(v);
-    parse_form_value(body, "capture_long", v, sizeof(v));
-    cfg.capture_long_action = config_store_action_from_name(v);
+    if (!parse_action_value(body, "assistant_short", &cfg.assistant_short_action) ||
+        !parse_action_value(body, "assistant_long", &cfg.assistant_long_action) ||
+        !parse_action_value(body, "capture_short", &cfg.capture_short_action) ||
+        !parse_action_value(body, "capture_long", &cfg.capture_long_action)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Missing or invalid button action");
+    }
+
     parse_form_value(body, "long_press_ms", v, sizeof(v));
-    if (v[0]) {
-        unsigned ms = (unsigned)strtoul(v, NULL, 10);
-        if (ms < 300) ms = 300;
-        if (ms > 5000) ms = 5000;
-        cfg.long_press_ms = (uint16_t)ms;
+    char *end = NULL;
+    unsigned long ms = strtoul(v, &end, 10);
+    if (!v[0] || !end || *end || ms < 300 || ms > 5000) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Long press must be between 300 and 5000 ms");
     }
+    cfg.long_press_ms = (uint16_t)ms;
+
     parse_form_value(body, "webui_timeout_seconds", v, sizeof(v));
-    if (v[0]) {
-        unsigned seconds = (unsigned)strtoul(v, NULL, 10);
-        if (seconds < 15) seconds = 15;
-        if (seconds > 1800) seconds = 1800;
-        cfg.webui_timeout_after_ble_connected_ms = seconds * 1000U;
+    end = NULL;
+    unsigned long seconds = strtoul(v, &end, 10);
+    if (!v[0] || !end || *end || seconds < 15 || seconds > 1800) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Web UI timeout must be between 15 and 1800 seconds");
     }
+    cfg.webui_timeout_after_ble_connected_ms = (uint32_t)seconds * 1000U;
+
     parse_form_value(body, "disable_ap_on_suspend", v, sizeof(v));
-    if (v[0]) {
-        cfg.disable_ap_on_usb_suspend = (strcmp(v, "on") == 0 || strcmp(v, "true") == 0 || strcmp(v, "1") == 0);
-    } else {
+    if (strcmp(v, "on") == 0) {
+        cfg.disable_ap_on_usb_suspend = true;
+    } else if (strcmp(v, "off") == 0) {
         cfg.disable_ap_on_usb_suspend = false;
+    } else {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "Invalid suspend setting");
     }
-    config_store_set(&cfg);
+
+    err = config_store_set(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE("WEB", "Configuration persistence failed: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "Configuration could not be saved to flash");
+    }
+
+    s_deadline_set = false;
     update_webui_deadline();
     return keymap_get_handler(req);
 }
 
 static esp_err_t disable_handler(httpd_req_t *req)
 {
-    simple_ok(req);
-    web_server_stop();
-    return ESP_OK;
+    esp_err_t err = simple_ok(req);
+    if (err == ESP_OK) s_stop_requested = true;
+    return err;
 }
 
 static esp_err_t reboot_handler(httpd_req_t *req)
@@ -541,6 +596,12 @@ static void web_monitor_task(void *arg)
             s_start_explicit = false;
             web_server_start(explicit_request);
         }
+        if (s_stop_requested) {
+            s_stop_requested = false;
+            web_server_stop();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         if (s_dhcp_ensure_requested) {
             s_dhcp_ensure_requested = false;
             ensure_ap_dhcp_running();
@@ -573,15 +634,15 @@ static void web_monitor_task(void *arg)
         }
         dongle_config_t cfg;
         config_store_get(&cfg);
-        if (cfg.disable_ap_on_usb_suspend) {
-            if (s_usb_suspended && s_httpd && !s_ap_stopped_for_suspend) {
+        if (s_ap_stopped_for_suspend && !s_usb_suspended) {
+            ESP_LOGI("WEB", "Restarting Web UI/AP after USB resume");
+            web_server_request_start(false);
+            s_ap_stopped_for_suspend = false;
+        } else if (cfg.disable_ap_on_usb_suspend) {
+            if (s_usb_suspended && s_httpd && !s_ap_stopped_for_suspend && s_sta_count == 0) {
                 ESP_LOGI("WEB", "Stopping Web UI/AP due to USB suspend");
                 web_server_stop();
                 s_ap_stopped_for_suspend = true;
-            } else if (!s_usb_suspended && s_ap_stopped_for_suspend) {
-                ESP_LOGI("WEB", "Restarting Web UI/AP after USB resume");
-                web_server_request_start(false);
-                s_ap_stopped_for_suspend = false;
             }
         }
         dongle_status_t st;
@@ -714,6 +775,7 @@ void web_server_stop(void)
     captive_portal_stop();
     s_start_requested = false;
     s_start_explicit = false;
+    s_stop_requested = false;
     s_sta_count = 0;
     s_dhcp_wait_logged = false;
     s_dhcp_ensure_requested = false;

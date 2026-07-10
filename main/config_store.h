@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "esp_err.h"
+
 typedef enum {
     DONGLE_ACTION_NONE = 0,
     DONGLE_ACTION_KEY_F13,
@@ -58,6 +60,6 @@ typedef struct {
 void config_store_defaults(dongle_config_t *cfg);
 void config_store_init(void);
 void config_store_get(dongle_config_t *out);
-void config_store_set(const dongle_config_t *cfg);
+esp_err_t config_store_set(const dongle_config_t *cfg);
 const char *config_store_action_name(uint8_t action);
 uint8_t config_store_action_from_name(const char *name);

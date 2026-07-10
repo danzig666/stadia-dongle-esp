@@ -104,9 +104,11 @@ static void update_compat_locked(void)
     s_status.controller_bonded = first->bonded;
     s_status.battery_percent = first->battery_percent;
     s_status.stadia = first->stadia;
+    s_status.xbox_valid = first->xbox_valid;
     if (first->xbox_valid) {
         memcpy(s_status.xbox, first->xbox, DONGLE_XBOX_REPORT_SIZE);
-        s_status.xbox_valid = true;
+    } else {
+        memset(s_status.xbox, 0, DONGLE_XBOX_REPORT_SIZE);
     }
 }
 
