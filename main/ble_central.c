@@ -120,6 +120,8 @@ typedef struct {
     uint32_t rumble_write_count;
     int last_rumble_status;
     bool rumble_completion_seen;
+    bool rumble_in_flight;
+    bool rumble_dirty;
 } controller_slot_t;
 
 typedef struct {
@@ -883,6 +885,21 @@ static int cccd_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
     return 0;
 }
 
+/*
+ * Rumble delivery is latest-value-wins with a guaranteed final state.
+ *
+ * Only one GATT write may be outstanding per slot (rumble_in_flight). The most
+ * recent payload lives in slot->rumble_payload and sets rumble_dirty; after
+ * every completion we re-check whether it changed while the write was running.
+ * Failures - both at submission (rc != 0, typically an exhausted
+ * BLE_GATT_MAX_PROCS pool under rapid updates) and at completion
+ * (err->status != 0) - are retried instead of dropped.
+ *
+ * Without this, a dropped packet that happens to be the "both motors off"
+ * value leaves the controller vibrating until the next rumble event arrives.
+ */
+#define RUMBLE_RETRY_MS 15
+
 static int rumble_write_fn(uint16_t conn_handle, const struct ble_gatt_error *err,
                            struct ble_gatt_attr *attr, void *arg)
 {
@@ -893,10 +910,21 @@ static int rumble_write_fn(uint16_t conn_handle, const struct ble_gatt_error *er
     slot->last_rumble_complete_us = esp_timer_get_time();
     slot->last_rumble_status = err->status;
     slot->rumble_completion_seen = true;
+    slot->rumble_in_flight = false;
+
     if (err->status != 0) {
-        ESP_LOGW(TAG, "slot %u usb %u rumble completion failed conn=%u status=%d (%s)",
+        /* The packet never reached the controller - resend the current value. */
+        slot->rumble_dirty = true;
+        ESP_LOGW(TAG, "slot %u usb %u rumble completion failed conn=%u status=%d (%s), retrying",
                  slot->slot_index, slot->usb_gamepad_index, conn_handle,
                  err->status, ble_status_name(err->status));
+    }
+
+    if (slot->rumble_dirty) {
+        ble_npl_callout_reset(&slot->rumble_callout,
+                              (err->status != 0)
+                                  ? ble_npl_time_ms_to_ticks32(RUMBLE_RETRY_MS)
+                                  : 0);
     }
     return 0;
 }
@@ -905,16 +933,27 @@ static void rumble_callout_fn(struct ble_npl_event *ev)
 {
     controller_slot_t *slot = ble_npl_event_get_arg(ev);
     if (!slot || !slot->used || slot->state != CONTROLLER_SLOT_READY || !slot->output_val_handle) return;
+
+    /* A write is still outstanding; rumble_write_fn() will pick this up. */
+    if (slot->rumble_in_flight) return;
+
+    slot->rumble_dirty = false;
+    slot->rumble_in_flight = true;
+
     int rc = ble_gattc_write_flat(slot->conn_handle, slot->output_val_handle,
                                   slot->rumble_payload, DONGLE_RUMBLE_REPORT_SIZE,
                                   rumble_write_fn, slot);
     if (rc != 0) {
-        ESP_LOGW(TAG, "slot %u usb %u rumble write start failed conn=%u rc=%d",
+        slot->rumble_in_flight = false;
+        slot->rumble_dirty = true;
+        ble_npl_callout_reset(&slot->rumble_callout,
+                              ble_npl_time_ms_to_ticks32(RUMBLE_RETRY_MS));
+        ESP_LOGW(TAG, "slot %u usb %u rumble write start failed conn=%u rc=%d, retrying",
                  slot->slot_index, slot->usb_gamepad_index, slot->conn_handle, rc);
     } else {
         slot->last_rumble_start_us = esp_timer_get_time();
         slot->rumble_write_count++;
-        ESP_LOGI(TAG, "slot %u usb %u rumble routed", slot->slot_index, slot->usb_gamepad_index);
+        ESP_LOGD(TAG, "slot %u usb %u rumble routed", slot->slot_index, slot->usb_gamepad_index);
     }
 }
 
@@ -929,7 +968,12 @@ void ble_central_send_rumble(uint8_t gamepad_index, const uint8_t *payload, size
         return;
     }
     memcpy(slot->rumble_payload, payload, DONGLE_RUMBLE_REPORT_SIZE);
-    ble_npl_callout_reset(&slot->rumble_callout, 0);
+    slot->rumble_dirty = true;
+    /* While a write is outstanding, rumble_write_fn() schedules the follow-up;
+     * kicking the callout here would only run into the in_flight guard. */
+    if (!slot->rumble_in_flight) {
+        ble_npl_callout_reset(&slot->rumble_callout, 0);
+    }
     if (s_slot_lock) xSemaphoreGive(s_slot_lock);
 }
 
